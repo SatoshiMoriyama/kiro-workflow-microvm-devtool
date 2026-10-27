@@ -53,7 +53,7 @@ export class MicrovmStack extends cdk.Stack {
     // --- IAM: buildRole(イメージビルド時) ---
     const buildRole = new iam.Role(this, "BuildRole", {
       assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
-      description: "MicroVM イメージビルド時に assume。artifact read + logs write。",
+      description: "MicroVM image build role: read artifact, write logs",
     });
     artifactBucket.grantRead(buildRole);
     logGroup.grantWrite(buildRole);
@@ -61,7 +61,7 @@ export class MicrovmStack extends cdk.Stack {
     // --- IAM: executionRole(MicroVM 実行時) ---
     const executionRole = new iam.Role(this, "ExecutionRole", {
       assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
-      description: "MicroVM 実行時に assume。result バケットへ PutObject。",
+      description: "MicroVM execution role: PutObject to result bucket",
     });
     resultBucket.grantPut(executionRole);
     logGroup.grantWrite(executionRole);
@@ -83,19 +83,21 @@ export class MicrovmStack extends cdk.Stack {
         uri: artifactBucket.s3UrlForObject(artifactKey),
       },
       resources: [{ minimumMemoryInMiB: 512 }],
-      cpuConfigurations: [{ architecture: "arm64" }],
+      cpuConfigurations: [{ architecture: "ARM_64" }],
       egressNetworkConnectors: ["INTERNET_EGRESS"],
       environmentVariables: [
         { key: "RESULT_BUCKET", value: resultBucket.bucketName },
       ],
+      // ready/run はフックの有効化フラグ(ENABLED/DISABLED)。
+      // 実際のパス(/aws/lambda-microvms/runtime/v1/{ready,run})はサーバ側が実装する。
       hooks: {
         port: 8080,
         microvmImageHooks: {
-          ready: "/aws/lambda-microvms/runtime/v1/ready",
+          ready: "ENABLED",
           readyTimeoutInSeconds: 60,
         },
         microvmHooks: {
-          run: "/aws/lambda-microvms/runtime/v1/run",
+          run: "ENABLED",
           runTimeoutInSeconds: 60,
         },
       },
