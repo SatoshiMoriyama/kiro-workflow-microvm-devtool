@@ -8,7 +8,7 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-ap-northeast-1}"
 PROFILE="${AWS_PROFILE:-work}"
-STACK="${STACK_NAME:-KiroMicrovmPhase1}"
+STACK="${STACK_NAME:-KiroMicrovmPhase1Base}"
 IMAGE_NAME="${MICROVM_IMAGE_NAME:-kiro-phase1}"
 
 aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }

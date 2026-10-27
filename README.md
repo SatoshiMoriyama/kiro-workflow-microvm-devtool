@@ -40,6 +40,11 @@ Phase1 は「MicroVM が起動して結果を S3 に吐く」最小疎通の確�
 
 ## 手順
 
+鶏卵問題(`CfnMicrovmImage` は zip を要求するが deploy 中にビルドまで走るため zip を先に置けない)を避けるため、スタックを2つに分ける。
+
+- `KiroMicrovmPhase1Base`: S3 x2 + IAM x2 + LogGroup(zip 不要)
+- `KiroMicrovmPhase1Image`: `CfnMicrovmImage`(zip 必須)
+
 ```bash
 # 1. 依存インストール
 pnpm install
@@ -47,15 +52,14 @@ pnpm install
 # 2. (初回のみ) CDK bootstrap
 AWS_PROFILE=work pnpm --filter infra exec cdk bootstrap aws://495236580548/ap-northeast-1
 
-# 3. バケット/ロールを先に作る(イメージはこの時点では zip 不在でビルド失敗しうるため、
-#    まずバケットだけ作り、zip 投入後にイメージを再デプロイする二段構え)
-AWS_PROFILE=work pnpm --filter infra deploy
+# 3. 基盤を先にデプロイ(artifact バケットは固定名で作られる)
+AWS_PROFILE=work pnpm --filter infra exec cdk deploy KiroMicrovmPhase1Base
 
-# 4. code artifact を zip 化して artifact バケットへ
+# 4. code artifact を zip 化して artifact バケットへ投入
 AWS_PROFILE=work ./scripts/package-image.sh
 
-# 5. イメージをビルドさせる(zip 投入後に再 deploy、または update-microvm-image)
-AWS_PROFILE=work pnpm --filter infra deploy
+# 5. zip が置かれた状態でイメージをデプロイ(ここでビルドが走る。数分)
+AWS_PROFILE=work pnpm --filter infra exec cdk deploy KiroMicrovmPhase1Image
 
 # 6. MicroVM を起動して結果を回収
 AWS_PROFILE=work ./scripts/run.sh
@@ -63,9 +67,15 @@ AWS_PROFILE=work ./scripts/run.sh
 
 成功条件: `run.sh` が result バケットから `hello from microvm <timestamp>` を取得して表示する。
 
-## 未検証（実機で詰める）
+## 検証状況
 
-- `CfnMicrovmImage` が zip 不在だとビルド失敗する場合のデプロイ順序（手順3/5 の二段構えで回避する想定）。
+確認済み(実機):
+- `lambda-microvms` は東京で利用可、base image は `al2023-1` 版 `2`。
+- `CfnMicrovmImage` の enum: architecture=`ARM_64`、hooks の ready/run=`ENABLED`/`DISABLED`。
+- `egressNetworkConnectors` はマネージドコネクタ ARN(`arn:aws:lambda:<region>:aws:network-connector:aws-network-connector:INTERNET_EGRESS`)。
+- zip 不在ビルドは `"The artifact was not found in S3."` で失敗 → Base/Image の2スタック分割で解消。
+
+未検証(次に詰める):
 - `run-microvm` のレスポンスの microvm 識別子フィールド名（`run.sh` は複数候補をフォールバック）。
-- `/ready` 即 200 でスナップショットが成立するか（アプリ初期化が実質ゼロのため問題ない見込み）。
-- arm64 ベースと Docker ビルドアーキテクチャの整合。
+- `/ready` 即 200 でスナップショットが成立するか。
+- イメージビルド(Dockerfile の dnf, hook_server 起動)が通るか。
