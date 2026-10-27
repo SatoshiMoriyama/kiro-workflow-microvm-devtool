@@ -3,6 +3,7 @@ import { Construct } from "constructs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { CfnMicrovmImage } from "aws-cdk-lib/aws-lambda";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -12,6 +13,7 @@ export interface ImageStackProps extends cdk.StackProps {
   readonly resultBucket: s3.IBucket;
   readonly buildRole: iam.IRole;
   readonly logGroup: logs.ILogGroup;
+  readonly apiKeySecret: secretsmanager.ISecret;
 }
 
 /**
@@ -48,7 +50,8 @@ export class ImageStack extends cdk.Stack {
 
     const image = new CfnMicrovmImage(this, "KiroPhase1Image", {
       name: "kiro-phase1",
-      description: "Phase1: 起動して echo 結果を S3 に吐く最小 MicroVM イメージ",
+      description:
+        "Phase2: MicroVM 上で Kiro CLI を headless 実行し成果物を S3 に格納する",
       baseImageArn,
       baseImageVersion,
       additionalOsCapabilities: [],
@@ -56,11 +59,17 @@ export class ImageStack extends cdk.Stack {
       codeArtifact: {
         uri: props.artifactBucket.s3UrlForObject(artifactKey),
       },
-      resources: [{ minimumMemoryInMiB: 512 }],
+      resources: [{ minimumMemoryInMiB: 2048 }],
       cpuConfigurations: [{ architecture: "ARM_64" }],
       egressNetworkConnectors: [internetEgressArn],
       environmentVariables: [
         { key: "RESULT_BUCKET", value: props.resultBucket.bucketName },
+        // 実キーは焼かず ARN のみ注入する。/run 実行時に executionRole の
+        // 短命 credential でゲストが Secrets Manager から値を取得する。
+        {
+          key: "KIRO_API_KEY_SECRET_ARN",
+          value: props.apiKeySecret.secretArn,
+        },
       ],
       // ready/run はフックの有効化フラグ(ENABLED/DISABLED)。
       // 実際のパス(/aws/lambda-microvms/runtime/v1/{ready,run})はサーバ側が実装する。
@@ -72,7 +81,8 @@ export class ImageStack extends cdk.Stack {
         },
         microvmHooks: {
           run: "ENABLED",
-          runTimeoutInSeconds: 60,
+          // Kiro 実行(ゲスト timeout 840)+ S3 put の余白を見た値。
+          runTimeoutInSeconds: 900,
         },
       },
       logging: {

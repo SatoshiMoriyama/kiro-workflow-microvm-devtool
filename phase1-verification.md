@@ -147,6 +147,23 @@ aws s3 cp s3://<bucket>/runs/<id>/weather.html ./weather.html
 - AWS CLI 認証・リージョン、当該アカウントで `aws lambda-microvms` が使えるか（新機能のため要確認）。
 - API キーで `shell`/`web_fetch` と対象モデルが実際に使えるか（実機検証）。
 
+## Phase2 で確定した事項（2026-10-28 追記）
+
+Phase2 設計（`.agents/tasks/design.md`）の調査で以下が確定した。
+
+- 配布 URL と musl 選択: `https://desktop-release.q.us-east-1.amazonaws.com/latest/` が公式配布パス。gnu ビルドは install.sh の glibc 検査で 2.39 以上を要求するが AL2023 は 2.34 のため弾かれ、"musl 版を使え" と案内される。静的リンクの `kirocli-aarch64-linux-musl.zip` を採用。
+- BUILD_VERSION: 実測 2.35.0（gnu/musl とも）。`latest` は時点依存のため版は BUILD-INFO で記録する運用。
+- `install.sh` 挙動: `Q_INSTALL_GLOBAL=1` で `kiro-cli` / `kiro-cli-chat` / `kiro-cli-term` を `/usr/local/bin` に導入。`Q_SKIP_SETUP=1` で setup / dotfiles 連携をスキップ = ビルド時に認証を焼かない（API キー認証が優先順位で無視される事故を回避）。
+
+## Phase2 の残課題（実機検証＝ユーザー実施）
+
+静的検証（synth / tsc / bash -n / py_compile / 単体テスト）は本ワークフローで通した。以下は実 AWS 上でのみ確認できる。
+
+- エージェント設定 JSON（`~/.kiro/agents/*.json`）の `tools` / `permissions` の正確なスキーマ。現状は設定ファイルを置かず `--trust-all-tools` 単独で進める。不足が判明したら最小 JSON を追加する段階対応。
+- `--trust-all-tools` 単独で shell（curl）/ fs / web が承認待ちなしで通るか。
+- API キーで使えるツール・モデルの可用性。
+- `minimumMemoryInMiB=2048` / `runTimeoutInSeconds=900` の妥当性（OOM しないか、天気取得＋HTML 生成が時間内に収まるか）。余れば下げる。
+
 ## 参考
 
 - Kiro CLI: API Key Authentication / kiro-cli login / kiro-cli chat `--no-interactive`

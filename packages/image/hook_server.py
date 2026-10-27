@@ -1,70 +1,383 @@
 #!/usr/bin/env python3
-"""Phase1 最小フックサーバ。
+"""Phase2 フックサーバ。
 
 Lambda MicroVM のライフサイクルフックを HTTP で受ける常駐プロセス。
 
 - GET/POST /aws/lambda-microvms/runtime/v1/ready
     ビルド時。即 200 を返す(初期化完了シグナル -> スナップショット取得)。
 - GET/POST /aws/lambda-microvms/runtime/v1/run
-    run-microvm 後に 1 回呼ばれる。echo 結果を S3 に put して 200 を返す。
+    run-microvm 後に 1 回呼ばれる。Secrets Manager から KIRO_API_KEY を取得し、
+    `kiro-cli chat --trust-all-tools --no-interactive "<prompt>"` を同期実行して、
+    生成ファイル・stdout・status.json を S3 prefix 配下へ put してから 200/500 を返す。
 
-結果は環境変数 RESULT_BUCKET のバケットへ `result-<microvm-id>.txt` として書く。
+成果物は環境変数 RESULT_BUCKET のバケットの prefix(runs/<requestId>/)配下に置く。
+KIRO_API_KEY の値は CloudWatch Logs・S3 成果物・status.json・レスポンスに一切出さない。
 """
 
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 READY_PATH = "/aws/lambda-microvms/runtime/v1/ready"
 RUN_PATH = "/aws/lambda-microvms/runtime/v1/run"
 PORT = int(os.environ.get("HOOK_PORT", "8080"))
 
+# prompt 未指定時のデフォルト(run.sh 側にも同じ既定を持つ)。
+DEFAULT_PROMPT = "札幌の天気を調べて weather.html を作って"
+
+# ゲスト内で kiro-cli を実行する作業ディレクトリのベース。
+WORKDIR_BASE = "/tmp/kiro-work"
+
+# タイムアウト階層の内側(ゲスト kiro-cli プロセス)。設計の確定値。
+# 840 < /run 900 < VM 寿命 1200 < ホストポーリング 1260。
+KIRO_TIMEOUT_SECONDS = 840
+
+# 成果物として put しない予約名。
+RESERVED_NAMES = {"kiro-stdout.txt", "status.json"}
+
+# キー形式の保険パターン(第2段マスク)。
+_KSK_PATTERN = re.compile(r"ksk_\S+")
+
+# contains_secret でテキストとして重点チェックする拡張子。
+_TEXT_EXTENSIONS = (".txt", ".html", ".md", ".json", ".log")
+
 
 def log(msg: str) -> None:
     print(f"[hook_server] {msg}", flush=True)
 
 
-def write_result_to_s3(prefix: str, request_id: str) -> tuple[bool, str]:
-    """echo 相当の結果を S3 に put する。成否とメッセージを返す。
+# --------------------------------------------------------------------------
+# 純関数ユーティリティ(kiro-cli / AWS に依存しない。単体テスト対象)
+# --------------------------------------------------------------------------
 
-    prefix: 依頼ごとのキー接頭辞(例 "runs/req-.../")。末尾スラッシュ込み想定。
-    request_id: ログ/本文に埋める依頼ID(任意)。
+
+def mask_secret(text, api_key):
+    """API キーの非漏洩マスク(二段構え)。
+
+    第1段: api_key(非空時)を文字列完全一致で [REDACTED] に置換。
+    第2段: 正規表現 ksk_\\S+ を [REDACTED] に置換。
+    text が非文字列でも落ちない(str() してから処理)。
     """
-    bucket = os.environ.get("RESULT_BUCKET", "").strip()
-    if not bucket:
-        return False, "RESULT_BUCKET is not set"
+    if not isinstance(text, str):
+        text = str(text)
+    if api_key:
+        text = text.replace(api_key, "[REDACTED]")
+    text = _KSK_PATTERN.sub("[REDACTED]", text)
+    return text
 
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    body = f"hello from microvm {now} (requestId={request_id or '-'})\n"
-    # prefix 配下に固定ファイル名で置く。prefix 未指定なら従来互換のフラット配置。
-    if prefix:
-        if not prefix.endswith("/"):
-            prefix += "/"
-        key = f"{prefix}result.txt"
-    else:
-        key = f"result-{uuid.uuid4().hex[:12]}.txt"
-    s3_uri = f"s3://{bucket}/{key}"
 
+def select_artifacts(workdir):
+    """workdir 直下(非再帰)の通常ファイル名のみを昇順で返す。
+
+    除外: "." 始まりの隠しファイル、ディレクトリ、予約名(kiro-stdout.txt / status.json)。
+    戻りは basename の昇順リスト。
+    """
+    result = []
+    try:
+        entries = os.listdir(workdir)
+    except OSError:
+        return result
+    for name in entries:
+        if name.startswith("."):
+            continue
+        if name in RESERVED_NAMES:
+            continue
+        full = os.path.join(workdir, name)
+        if not os.path.isfile(full):
+            continue
+        result.append(name)
+    result.sort()
+    return result
+
+
+def contains_secret(path, api_key):
+    """ファイル内容に実キー値(非空時)または ksk_\\S+ が含まれれば True。
+
+    バイナリ/読取失敗はベストエフォート(例外時 False)。テキスト系拡張子を重点チェック。
+    """
+    try:
+        lower = path.lower()
+        is_text_ext = lower.endswith(_TEXT_EXTENSIONS)
+        # テキスト系は厳格に、それ以外もベストエフォートで中身を読む。
+        with open(path, "r", encoding="utf-8", errors="strict" if is_text_ext else "ignore") as fh:
+            content = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if api_key and api_key in content:
+        return True
+    if _KSK_PATTERN.search(content):
+        return True
+    return False
+
+
+def build_status(
+    request_id,
+    prompt,
+    exit_code,
+    timed_out,
+    artifacts,
+    skipped,
+    stdout_key,
+    started_at,
+    finished_at,
+):
+    """status.json の辞書を組み立てる。
+
+    ok = (exit_code == 0 and not timed_out)。exit_code は None 許容。
+    キー名は設計 §3 status.json スキーマの原文どおり。
+    """
+    ok = (exit_code == 0) and (not timed_out)
+    return {
+        "requestId": request_id,
+        "prompt": prompt,
+        "exitCode": exit_code,
+        "timedOut": bool(timed_out),
+        "artifacts": list(artifacts),
+        "skippedArtifacts": list(skipped),
+        "stdoutKey": stdout_key,
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "ok": ok,
+    }
+
+
+def parse_run_payload(outer_raw):
+    """/run の外側ボディ { "microvmId", "runHookPayload" } を読み、
+
+    内側 runHookPayload(文字列 JSON)を再パースして
+    (payload_dict, microvm_id) を返す。prompt の補完は呼び出し側で行う。
+    パース不能なら payload は {}。
+    """
+    if isinstance(outer_raw, (bytes, bytearray)):
+        try:
+            outer_raw = outer_raw.decode("utf-8")
+        except Exception:  # noqa: BLE001
+            return {}, ""
+    if not isinstance(outer_raw, str) or not outer_raw.strip():
+        return {}, ""
+    try:
+        outer = json.loads(outer_raw)
+    except Exception as exc:  # noqa: BLE001
+        log(f"run body parse failed: {exc}")
+        return {}, ""
+    if not isinstance(outer, dict):
+        return {}, ""
+    microvm_id = str(outer.get("microvmId", "") or "")
+    inner_raw = outer.get("runHookPayload", "") or ""
+    payload = {}
+    if isinstance(inner_raw, str) and inner_raw.strip():
+        try:
+            parsed = json.loads(inner_raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception as exc:  # noqa: BLE001
+            log(f"runHookPayload parse failed: {exc}")
+    return payload, microvm_id
+
+
+def resolve_prompt(payload):
+    """payload["prompt"] を取り出し、未指定/空/非文字列ならデフォルトへ。"""
+    value = payload.get("prompt") if isinstance(payload, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value
+    return DEFAULT_PROMPT
+
+
+# --------------------------------------------------------------------------
+# AWS / kiro-cli 連携
+# --------------------------------------------------------------------------
+
+
+def _fetch_api_key(secret_arn):
+    """Secrets Manager から KIRO_API_KEY を取得する。
+
+    戻り値: (api_key, error)。成功時は (値, None)、失敗時は (None, 値を伏せた理由)。
+    例外メッセージも素で返さず、キー値が混ざりうる箇所は出さない。
+    """
     try:
         proc = subprocess.run(
-            ["aws", "s3", "cp", "-", s3_uri],
-            input=body.encode("utf-8"),
+            [
+                "aws",
+                "secretsmanager",
+                "get-secret-value",
+                "--secret-id",
+                secret_arn,
+                "--query",
+                "SecretString",
+                "--output",
+                "text",
+            ],
             capture_output=True,
             timeout=30,
         )
+    except Exception:  # noqa: BLE001
+        return None, "api key fetch failed to launch"
+    if proc.returncode != 0:
+        return None, f"api key fetch exited {proc.returncode}"
+    value = proc.stdout.decode("utf-8", "replace").strip()
+    if not value:
+        return None, "api key is empty"
+    return value, None
+
+
+def _s3_put_bytes(bucket, key, data):
+    """標準入力経由で S3 に put する。成否とエラー文字列を返す。"""
+    s3_uri = f"s3://{bucket}/{key}"
+    try:
+        proc = subprocess.run(
+            ["aws", "s3", "cp", "-", s3_uri],
+            input=data,
+            capture_output=True,
+            timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"aws s3 cp(stdin) failed to launch: {exc}"
+    if proc.returncode != 0:
+        return False, (
+            f"aws s3 cp(stdin) exited {proc.returncode}: "
+            f"{proc.stderr.decode('utf-8', 'replace')}"
+        )
+    return True, s3_uri
+
+
+def _s3_put_file(bucket, key, path):
+    """ローカルファイルを S3 に put する。成否とエラー文字列を返す。"""
+    s3_uri = f"s3://{bucket}/{key}"
+    try:
+        proc = subprocess.run(
+            ["aws", "s3", "cp", path, s3_uri],
+            capture_output=True,
+            timeout=120,
+        )
     except Exception as exc:  # noqa: BLE001
         return False, f"aws s3 cp failed to launch: {exc}"
-
     if proc.returncode != 0:
         return False, (
             f"aws s3 cp exited {proc.returncode}: "
             f"{proc.stderr.decode('utf-8', 'replace')}"
         )
     return True, s3_uri
+
+
+def run_kiro_and_upload(prefix, request_id, prompt):
+    """Kiro CLI を同期実行し、stdout・成果物・status.json を S3 に put する。
+
+    戻り値: (ok, status_dict)。ok は (exitCode==0 and not timedOut)。
+    失敗時も status.json は必ず put する。KIRO_API_KEY の値はログ・返り値・
+    status・成果物に一切出さない。
+    """
+    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    bucket = os.environ.get("RESULT_BUCKET", "").strip()
+    if not bucket:
+        # バケットが無いと status も put できない。致命として扱う。
+        raise RuntimeError("RESULT_BUCKET is not set")
+
+    stdout_key = f"{prefix}kiro-stdout.txt"
+    status_key = f"{prefix}status.json"
+
+    def finalize(api_key, exit_code, timed_out, artifacts, skipped):
+        finished_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        status = build_status(
+            request_id=request_id,
+            prompt=prompt,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            artifacts=artifacts,
+            skipped=skipped,
+            stdout_key=stdout_key,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        body = json.dumps(status, ensure_ascii=False, indent=2)
+        body = mask_secret(body, api_key)
+        put_ok, detail = _s3_put_bytes(bucket, status_key, body.encode("utf-8"))
+        if not put_ok:
+            log(f"status.json put failed: {mask_secret(detail, api_key)}")
+        return status
+
+    # ① API キー取得(値はログ/返り値に出さない)
+    secret_arn = os.environ.get("KIRO_API_KEY_SECRET_ARN", "").strip()
+    if not secret_arn:
+        log("KIRO_API_KEY_SECRET_ARN is not set")
+        status = finalize(None, None, False, [], [])
+        return False, status
+
+    api_key, err = _fetch_api_key(secret_arn)
+    if api_key is None:
+        # err は値を伏せた理由のみ。
+        log(f"api key fetch failed: {err}")
+        status = finalize(None, None, False, [], [])
+        return False, status
+
+    # ③ 作業ディレクトリ作成
+    workdir = os.path.join(WORKDIR_BASE, request_id or "default")
+    os.makedirs(workdir, exist_ok=True)
+
+    # ④ kiro-cli 実行(API キーは子プロセス env にのみ渡す)
+    env = dict(os.environ)
+    env["KIRO_API_KEY"] = api_key
+    exit_code = None
+    timed_out = False
+    stdout_bytes = b""
+    try:
+        proc = subprocess.run(
+            [
+                "kiro-cli",
+                "chat",
+                "--trust-all-tools",
+                "--no-interactive",
+                prompt,
+            ],
+            cwd=workdir,
+            env=env,
+            capture_output=True,
+            timeout=KIRO_TIMEOUT_SECONDS,
+        )
+        exit_code = proc.returncode
+        stdout_bytes = proc.stdout or b""
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        exit_code = None
+        stdout_bytes = exc.stdout or b""
+        log("kiro-cli timed out")
+    except Exception as exc:  # noqa: BLE001
+        exit_code = None
+        log(f"kiro-cli failed to launch: {mask_secret(str(exc), api_key)}")
+
+    # ⑤ stdout をマスクして put
+    stdout_text = stdout_bytes.decode("utf-8", "replace")
+    stdout_masked = mask_secret(stdout_text, api_key)
+    put_ok, detail = _s3_put_bytes(
+        bucket, stdout_key, stdout_masked.encode("utf-8")
+    )
+    if not put_ok:
+        log(f"stdout put failed: {mask_secret(detail, api_key)}")
+
+    # ⑥ 成果物を選別し、キー混入チェックに合格したものだけ put
+    artifacts = []
+    skipped = []
+    for name in select_artifacts(workdir):
+        full = os.path.join(workdir, name)
+        if contains_secret(full, api_key):
+            skipped.append(name)
+            log(f"artifact skipped (secret detected): {name}")
+            continue
+        put_ok, detail = _s3_put_file(bucket, f"{prefix}{name}", full)
+        if put_ok:
+            artifacts.append(name)
+        else:
+            skipped.append(name)
+            log(f"artifact put failed: {name}: {mask_secret(detail, api_key)}")
+
+    # ⑦ status.json を生成・put
+    status = finalize(api_key, exit_code, timed_out, artifacts, skipped)
+    ok = status["ok"]
+    return ok, status
 
 
 class HookHandler(BaseHTTPRequestHandler):
@@ -77,12 +390,7 @@ class HookHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_run_body(self) -> tuple[dict, str]:
-        """/run のリクエストボディを読む。
-
-        Lambda は固定構造 { "microvmId": "...", "runHookPayload": "<文字列>" } を送る。
-        runHookPayload は文字列なので、こちら側でさらに JSON とみなしてパースする。
-        戻り値: (payload_dict, microvm_id)。パース不能なら payload は {}。
-        """
+        """/run のリクエストボディを読み、(payload_dict, microvm_id) を返す。"""
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
@@ -90,24 +398,7 @@ class HookHandler(BaseHTTPRequestHandler):
         if length <= 0:
             return {}, ""
         raw = self.rfile.read(length)
-        try:
-            outer = json.loads(raw.decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            log(f"run body parse failed: {exc}")
-            return {}, ""
-        if not isinstance(outer, dict):
-            return {}, ""
-        microvm_id = str(outer.get("microvmId", "") or "")
-        inner_raw = outer.get("runHookPayload", "") or ""
-        payload: dict = {}
-        if isinstance(inner_raw, str) and inner_raw.strip():
-            try:
-                parsed = json.loads(inner_raw)
-                if isinstance(parsed, dict):
-                    payload = parsed
-            except Exception as exc:  # noqa: BLE001
-                log(f"runHookPayload parse failed: {exc}")
-        return payload, microvm_id
+        return parse_run_payload(raw)
 
     def _handle(self) -> None:
         path = self.path.split("?", 1)[0]
@@ -119,21 +410,47 @@ class HookHandler(BaseHTTPRequestHandler):
             payload, microvm_id = self._read_run_body()
             request_id = str(payload.get("requestId", "")).strip()
             prefix = str(payload.get("prefix", "")).strip()
-            # prefix が未指定なら microvmId でフォールバック(依頼IDが無くても分離できる)。
+            prompt = resolve_prompt(payload)
+            # prefix 未指定なら microvmId でフォールバックし末尾スラッシュ正規化。
             if not prefix and microvm_id:
                 prefix = f"runs/{microvm_id}/"
+            if prefix and not prefix.endswith("/"):
+                prefix += "/"
             log(
                 f"run hook -> microvmId={microvm_id!r} "
                 f"prefix={prefix!r} requestId={request_id!r}"
             )
-            ok, detail = write_result_to_s3(prefix, request_id or microvm_id)
-            if ok:
-                log(f"run hook -> wrote {detail}")
-                self._respond(200, {"status": "done", "s3": detail})
-            else:
+            try:
+                ok, status = run_kiro_and_upload(
+                    prefix, request_id or microvm_id, prompt
+                )
+            except Exception as exc:  # noqa: BLE001
+                # RESULT_BUCKET 未設定など致命。キー値は env にしか無いので
+                # 例外文字列に混ざらない想定だが念のためパターンマスクのみ通す。
+                detail = mask_secret(str(exc), None)
                 log(f"run hook -> ERROR {detail}")
-                # run フック失敗は 500 で返す(外部トラフィックは届かない)
                 self._respond(500, {"status": "error", "detail": detail})
+                return
+            if ok:
+                log(f"run hook -> done exitCode={status.get('exitCode')}")
+                self._respond(
+                    200,
+                    {
+                        "status": "done",
+                        "exitCode": status.get("exitCode"),
+                        "artifacts": status.get("artifacts", []),
+                    },
+                )
+            else:
+                log(f"run hook -> error exitCode={status.get('exitCode')}")
+                self._respond(
+                    500,
+                    {
+                        "status": "error",
+                        "exitCode": status.get("exitCode"),
+                        "timedOut": status.get("timedOut"),
+                    },
+                )
             return
         # 未知パスは 404
         self._respond(404, {"status": "not_found", "path": path})

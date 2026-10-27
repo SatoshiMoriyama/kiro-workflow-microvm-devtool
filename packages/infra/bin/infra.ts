@@ -26,5 +26,6 @@ const image = new ImageStack(app, "KiroMicrovmPhase1Image", {
   resultBucket: base.resultBucket,
   buildRole: base.buildRole,
   logGroup: base.logGroup,
+  apiKeySecret: base.apiKeySecret,
 });
 image.addStackDependency(base);
