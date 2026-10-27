@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -57,7 +58,7 @@ class TestSelectArtifacts(unittest.TestCase):
 
 
 class TestBuildStatus(unittest.TestCase):
-    def _status(self, exit_code, timed_out, artifacts=None):
+    def _status(self, exit_code, timed_out, artifacts=None, failed_uploads=None):
         return hs.build_status(
             request_id="req-1",
             prompt="p",
@@ -65,6 +66,7 @@ class TestBuildStatus(unittest.TestCase):
             timed_out=timed_out,
             artifacts=artifacts or [],
             skipped=[],
+            failed_uploads=failed_uploads or [],
             stdout_key="runs/req-1/kiro-stdout.txt",
             started_at="s",
             finished_at="f",
@@ -89,6 +91,12 @@ class TestBuildStatus(unittest.TestCase):
         st = self._status(0, False, artifacts=[])
         self.assertTrue(st["ok"])
         self.assertEqual(st["artifacts"], [])
+
+    def test_ok_false_on_failed_uploads(self):
+        # exit 0 でも put 失敗があれば ok=false(設計 §5: put 非ゼロは致命)。
+        st = self._status(0, False, failed_uploads=["kiro-stdout.txt"])
+        self.assertFalse(st["ok"])
+        self.assertEqual(st["failedUploads"], ["kiro-stdout.txt"])
 
 
 class TestParsePayload(unittest.TestCase):
@@ -145,6 +153,106 @@ class TestContainsSecret(unittest.TestCase):
 
     def test_missing_file_false(self):
         self.assertFalse(hs.contains_secret("/no/such/file.txt", None))
+
+
+class TestRunKiroUploadFailures(unittest.TestCase):
+    """S3 put 失敗が ok=false に反映されることを確認する(設計 §5: 致命)。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        # 成果物 1 件を持つ作業ディレクトリ。
+        with open(os.path.join(self._workdir.name, "weather.html"), "w") as fh:
+            fh.write("<html>ok</html>")
+
+        patches = [
+            unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "RESULT_BUCKET": "bkt",
+                    "KIRO_API_KEY_SECRET_ARN": "arn:secret",
+                },
+                clear=False,
+            ),
+            unittest.mock.patch.object(
+                hs, "_fetch_api_key", return_value=("ksk_live", None)
+            ),
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        # request_id をディレクトリ名に合わせ、kiro-cli は即 exit 0 とする。
+        self._req = os.path.basename(self._workdir.name)
+
+    def _patch_kiro_exit0(self):
+        proc = unittest.mock.Mock()
+        proc.returncode = 0
+        proc.stdout = b"done"
+        return unittest.mock.patch.object(hs.subprocess, "run", return_value=proc)
+
+    def test_stdout_put_failure_sets_ok_false(self):
+        with self._patch_kiro_exit0(), unittest.mock.patch.object(
+            hs, "_s3_put_bytes"
+        ) as put_bytes, unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            # stdout put は失敗、status.json put は成功。
+            put_bytes.side_effect = [
+                (False, "aws s3 cp exited 1"),  # stdout
+                (True, "s3://status"),  # status.json
+            ]
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/", self._req, "p"
+            )
+        self.assertFalse(ok)
+        self.assertFalse(status["ok"])
+        self.assertIn("kiro-stdout.txt", status["failedUploads"])
+
+    def test_artifact_put_failure_sets_ok_false(self):
+        with self._patch_kiro_exit0(), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(False, "aws s3 cp exited 1")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/", self._req, "p"
+            )
+        self.assertFalse(ok)
+        self.assertFalse(status["ok"])
+        self.assertIn("weather.html", status["failedUploads"])
+        self.assertNotIn("weather.html", status["artifacts"])
+
+    def test_status_put_failure_returns_not_ok(self):
+        # stdout/成果物は成功だが status.json 自体の put が失敗 -> ok=false。
+        with self._patch_kiro_exit0(), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(hs, "_s3_put_bytes") as put_bytes:
+            put_bytes.side_effect = [
+                (True, "s3://stdout"),  # stdout
+                (False, "aws s3 cp exited 1"),  # status.json
+            ]
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/", self._req, "p"
+            )
+        # status["ok"] は put 内容上 true だが、status.json 自体を残せないので ok=false。
+        self.assertFalse(ok)
+
+    def test_all_success_ok_true(self):
+        with self._patch_kiro_exit0(), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/", self._req, "p"
+            )
+        self.assertTrue(ok)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["failedUploads"], [])
+        self.assertIn("weather.html", status["artifacts"])
 
 
 if __name__ == "__main__":
