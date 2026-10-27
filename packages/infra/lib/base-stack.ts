@@ -3,6 +3,7 @@ import { Construct } from "constructs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 
 /**
  * Phase1 基盤スタック(zip 不要で先にデプロイできるもの)。
@@ -22,6 +23,7 @@ export class BaseStack extends cdk.Stack {
   readonly buildRole: iam.Role;
   readonly executionRole: iam.Role;
   readonly logGroup: logs.LogGroup;
+  readonly apiKeySecret: secretsmanager.Secret;
   readonly artifactKey = "code/app.zip";
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -63,12 +65,23 @@ export class BaseStack extends cdk.Stack {
     this.artifactBucket.grantRead(this.buildRole);
     this.logGroup.grantWrite(this.buildRole);
 
+    // KIRO_API_KEY を入れる器。初期はランダムダミー値(CDK 自動生成)で、
+    // 実キーは後から `aws secretsmanager put-secret-value` で上書きする。
+    // 実キーは IaC/テンプレート/git に一切載せない。
+    this.apiKeySecret = new secretsmanager.Secret(this, "KiroApiKeySecret", {
+      secretName: "kiro-phase1/kiro-api-key",
+      description: "Kiro CLI の KIRO_API_KEY(値は put-secret-value で後から投入)",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.executionRole = new iam.Role(this, "ExecutionRole", {
       assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
-      description: "MicroVM execution role: PutObject to result bucket",
+      description: "MicroVM execution role: PutObject to result, read API key secret",
     });
     this.resultBucket.grantPut(this.executionRole);
     this.logGroup.grantWrite(this.executionRole);
+    // ゲストが短命 credential で KIRO_API_KEY を取得できるようにする。
+    this.apiKeySecret.grantRead(this.executionRole);
 
     new cdk.CfnOutput(this, "ArtifactBucketName", {
       value: this.artifactBucket.bucketName,
@@ -82,6 +95,10 @@ export class BaseStack extends cdk.Stack {
     new cdk.CfnOutput(this, "ExecutionRoleArn", {
       value: this.executionRole.roleArn,
       exportName: "KiroPhase1-ExecutionRoleArn",
+    });
+    new cdk.CfnOutput(this, "ApiKeySecretArn", {
+      value: this.apiKeySecret.secretArn,
+      exportName: "KiroPhase1-ApiKeySecretArn",
     });
     new cdk.CfnOutput(this, "LogGroupName", {
       value: this.logGroup.logGroupName,
