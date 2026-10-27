@@ -37,11 +37,12 @@ if [[ -z "$IMAGE_ARN" || "$IMAGE_ARN" == "None" ]]; then
 fi
 echo "[run] image arn       = $IMAGE_ARN"
 
+INTERNET_EGRESS_ARN="arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
 echo "[run] run-microvm..."
 RUN_JSON="$(aws lambda-microvms run-microvm \
   --image-identifier "$IMAGE_ARN" \
   --execution-role-arn "$EXEC_ROLE_ARN" \
-  --egress-network-connectors '["INTERNET_EGRESS"]' \
+  --egress-network-connectors "[\"$INTERNET_EGRESS_ARN\"]" \
   --maximum-duration-in-seconds 300)"
 MICROVM_ID="$(echo "$RUN_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("microvmId") or json.load(sys.stdin).get("microvmIdentifier",""))' 2>/dev/null || true)"
 if [[ -z "$MICROVM_ID" ]]; then

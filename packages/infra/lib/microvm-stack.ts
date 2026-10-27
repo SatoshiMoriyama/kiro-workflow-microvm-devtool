@@ -72,6 +72,13 @@ export class MicrovmStack extends cdk.Stack {
     // al2023-1 の最新 AVAILABLE 版(2026-10 時点で "2")。
     const baseImageVersion = this.node.tryGetContext("baseImageVersion") ?? "2";
 
+    // AWS マネージドのネットワークコネクタ ARN。
+    // 形式: arn:aws:lambda:<region>:aws:network-connector:aws-network-connector:<NAME>
+    // (出典: MicroVMs Troubleshooting ドキュメントの SHELL_INGRESS の例)
+    const connectorArn = (name: string) =>
+      `arn:aws:lambda:${region}:aws:network-connector:aws-network-connector:${name}`;
+    const internetEgressArn = connectorArn("INTERNET_EGRESS");
+
     const image = new CfnMicrovmImage(this, "KiroPhase1Image", {
       name: "kiro-phase1",
       description: "Phase1: 起動して echo 結果を S3 に吐く最小 MicroVM イメージ",
@@ -84,7 +91,7 @@ export class MicrovmStack extends cdk.Stack {
       },
       resources: [{ minimumMemoryInMiB: 512 }],
       cpuConfigurations: [{ architecture: "ARM_64" }],
-      egressNetworkConnectors: ["INTERNET_EGRESS"],
+      egressNetworkConnectors: [internetEgressArn],
       environmentVariables: [
         { key: "RESULT_BUCKET", value: resultBucket.bucketName },
       ],
