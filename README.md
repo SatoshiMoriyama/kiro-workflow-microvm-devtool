@@ -75,7 +75,10 @@ AWS_PROFILE=work ./scripts/run.sh
 - `egressNetworkConnectors` はマネージドコネクタ ARN(`arn:aws:lambda:<region>:aws:network-connector:aws-network-connector:INTERNET_EGRESS`)。
 - zip 不在ビルドは `"The artifact was not found in S3."` で失敗 → Base/Image の2スタック分割で解消。
 
-未検証(次に詰める):
-- `run-microvm` のレスポンスの microvm 識別子フィールド名（`run.sh` は複数候補をフォールバック）。
-- `/ready` 即 200 でスナップショットが成立するか。
-- イメージビルド(Dockerfile の dnf, hook_server 起動)が通るか。
+確認済み(2026-10-28 実機疎通):
+- イメージビルド成功(Graviton3/4 とも SUCCESSFUL)。Dockerfile の dnf(python3/awscli) と /ready フックが通る。
+- `run-microvm`(INTERNET_EGRESS) -> /run フック -> executionRole で `aws s3 cp` -> result バケットに出力 -> 手元で回収 -> terminate、まで全経路成立。
+- 出力例: `hello from microvm 2026-10-27T20:23:43.780973+00:00`
+- `run-microvm` レスポンスの識別子は `microvmId`。
+
+Phase1 完了。次は同じ構成に Kiro CLI を載せる(phase1-verification.md の設計)。
