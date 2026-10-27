@@ -4,3 +4,7 @@ cdk.out/
 *.tsbuildinfo
 .DS_Store
 *.zip
+results/
+packages/infra/artifact-hash.txt
+__pycache__/
+*.pyc

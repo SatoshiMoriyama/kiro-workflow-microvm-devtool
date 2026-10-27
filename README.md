@@ -36,7 +36,9 @@ Phase1 は「MicroVM が起動して結果を S3 に吐く」最小疎通の確�
 - **CDK で作れるのは MicroVM イメージまで**。実行インスタンス(`Microvm`)は CFN リソースに無く、`run-microvm` API で起動する。よって起動は `scripts/run.sh`。
 - **実行モデル**: Dockerfile の CMD でフックサーバを常駐 → `/ready` に 200 でスナップショット → `run-microvm` で復帰 → `/run` フックで echo→S3。
 - **認証/権限**: ゲストには executionRole の短命 credential が自動付与され、`aws s3 cp` が直接叩ける。長期キー不要。
-- **code artifact の zip** は CDK 外(`package-image.sh`)で固定キー `code/app.zip` に置き、URI を透明にする。`CfnMicrovmImage` はこの zip を参照するので zip アップロード → deploy の順。
+- **code artifact の zip** は CDK 外(`package-image.sh`)で内容ハッシュ付きキー `code/app-<hash>.zip` に置き、ハッシュを `packages/infra/artifact-hash.txt` に書き出す。`ImageStack` はそれを読んで URI を決める。zip が変わればキー(= URI)が変わるので CFN が差分を検知して再ビルドする。
+- **イメージ更新は常に CFN 経由**。CLI の `update-microvm-image` を直接叩くと、指定しなかったプロパティ(環境変数・hooks)が落ちてドリフトするため使わない。
+- **依頼ごとのプレフィックス**: `run.sh` が依頼ID(`req-<日時>-<pid>`)を生成し `--run-hook-payload` の JSON で prefix を渡す。`/run` ボディは `{"microvmId","runHookPayload"}` 構造で届き、hook_server が `runHookPayload`(文字列)を再パースして `runs/<requestId>/` 配下に格納する。prefix 未指定時は `microvmId` にフォールバック。
 
 ## 手順
 
@@ -55,17 +57,19 @@ AWS_PROFILE=work pnpm --filter infra exec cdk bootstrap aws://495236580548/ap-no
 # 3. 基盤を先にデプロイ(artifact バケットは固定名で作られる)
 AWS_PROFILE=work pnpm --filter infra exec cdk deploy KiroMicrovmPhase1Base
 
-# 4. code artifact を zip 化して artifact バケットへ投入
+# 4. code artifact を zip 化し、ハッシュ付きキーで投入(artifact-hash.txt も生成)
 AWS_PROFILE=work ./scripts/package-image.sh
 
 # 5. zip が置かれた状態でイメージをデプロイ(ここでビルドが走る。数分)
+#    image の中身を変えたら 4 -> 5 をやり直せば CFN が再ビルドする
 AWS_PROFILE=work pnpm --filter infra exec cdk deploy KiroMicrovmPhase1Image
 
-# 6. MicroVM を起動して結果を回収
+# 6. MicroVM を起動して結果を回収(依頼IDプレフィックス配下に格納・回収)
 AWS_PROFILE=work ./scripts/run.sh
 ```
 
-成功条件: `run.sh` が result バケットから `hello from microvm <timestamp>` を取得して表示する。
+成功条件: `run.sh` が `runs/<requestId>/result.txt` を取得し、
+`hello from microvm <timestamp> (requestId=...)` を表示して `results/<requestId>/` に回収する。
 
 ## 検証状況
 

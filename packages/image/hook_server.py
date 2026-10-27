@@ -28,15 +28,25 @@ def log(msg: str) -> None:
     print(f"[hook_server] {msg}", flush=True)
 
 
-def write_result_to_s3() -> tuple[bool, str]:
-    """echo 相当の結果を S3 に put する。成否とメッセージを返す。"""
+def write_result_to_s3(prefix: str, request_id: str) -> tuple[bool, str]:
+    """echo 相当の結果を S3 に put する。成否とメッセージを返す。
+
+    prefix: 依頼ごとのキー接頭辞(例 "runs/req-.../")。末尾スラッシュ込み想定。
+    request_id: ログ/本文に埋める依頼ID(任意)。
+    """
     bucket = os.environ.get("RESULT_BUCKET", "").strip()
     if not bucket:
         return False, "RESULT_BUCKET is not set"
 
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    body = f"hello from microvm {now}\n"
-    key = f"result-{uuid.uuid4().hex[:12]}.txt"
+    body = f"hello from microvm {now} (requestId={request_id or '-'})\n"
+    # prefix 配下に固定ファイル名で置く。prefix 未指定なら従来互換のフラット配置。
+    if prefix:
+        if not prefix.endswith("/"):
+            prefix += "/"
+        key = f"{prefix}result.txt"
+    else:
+        key = f"result-{uuid.uuid4().hex[:12]}.txt"
     s3_uri = f"s3://{bucket}/{key}"
 
     try:
@@ -66,6 +76,39 @@ class HookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _read_run_body(self) -> tuple[dict, str]:
+        """/run のリクエストボディを読む。
+
+        Lambda は固定構造 { "microvmId": "...", "runHookPayload": "<文字列>" } を送る。
+        runHookPayload は文字列なので、こちら側でさらに JSON とみなしてパースする。
+        戻り値: (payload_dict, microvm_id)。パース不能なら payload は {}。
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return {}, ""
+        raw = self.rfile.read(length)
+        try:
+            outer = json.loads(raw.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            log(f"run body parse failed: {exc}")
+            return {}, ""
+        if not isinstance(outer, dict):
+            return {}, ""
+        microvm_id = str(outer.get("microvmId", "") or "")
+        inner_raw = outer.get("runHookPayload", "") or ""
+        payload: dict = {}
+        if isinstance(inner_raw, str) and inner_raw.strip():
+            try:
+                parsed = json.loads(inner_raw)
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception as exc:  # noqa: BLE001
+                log(f"runHookPayload parse failed: {exc}")
+        return payload, microvm_id
+
     def _handle(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == READY_PATH:
@@ -73,7 +116,17 @@ class HookHandler(BaseHTTPRequestHandler):
             self._respond(200, {"status": "ready"})
             return
         if path == RUN_PATH:
-            ok, detail = write_result_to_s3()
+            payload, microvm_id = self._read_run_body()
+            request_id = str(payload.get("requestId", "")).strip()
+            prefix = str(payload.get("prefix", "")).strip()
+            # prefix が未指定なら microvmId でフォールバック(依頼IDが無くても分離できる)。
+            if not prefix and microvm_id:
+                prefix = f"runs/{microvm_id}/"
+            log(
+                f"run hook -> microvmId={microvm_id!r} "
+                f"prefix={prefix!r} requestId={request_id!r}"
+            )
+            ok, detail = write_result_to_s3(prefix, request_id or microvm_id)
             if ok:
                 log(f"run hook -> wrote {detail}")
                 self._respond(200, {"status": "done", "s3": detail})
