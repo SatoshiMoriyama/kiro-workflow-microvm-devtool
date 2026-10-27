@@ -1,0 +1,6 @@
+node_modules/
+dist/
+cdk.out/
+*.tsbuildinfo
+.DS_Store
+*.zip
