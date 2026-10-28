@@ -22,8 +22,10 @@ MicroVM の中で Kiro CLI を headless 実行し、指示タスク（例: 札�
 │  ├─ deploy.sh                 # Base -> zip 投入 -> Image を 1 コマンドで(pnpm deploy)
 │  ├─ package-image.sh          # packages/image を zip 化し artifact バケットへ
 │  └─ run.sh                    # run-microvm -> 結果をポーリング回収 -> terminate
-└─ verification.md              # 調査メモ(Kiro headless / 回収 / 承認)
+└─ README.md
 ```
+
+※ 調査・設計メモ(`verification.md` / `memo.md`)は `blog/` に置き、リポジトリには含めない(gitignore)。
 
 ## 前提
 
@@ -106,4 +108,4 @@ kiro-cli の配布 URL や版を変えるときは、`run-microvm` が AWS 側�
 - 出力例: `hello from microvm 2026-10-27T20:23:43.780973+00:00`
 - `run-microvm` レスポンスの識別子は `microvmId`。
 
-その後 echo を Kiro CLI の headless 実行に置き換え、「札幌の天気を調べて weather.html を作って」で成果物が `runs/<requestId>/` 配下に出ることを実機確認済み(KIRO_API_KEY 漏洩なし、`ok:true`)。設計メモは verification.md。
+その後 echo を Kiro CLI の headless 実行に置き換え、「札幌の天気を調べて weather.html を作って」で成果物が `runs/<requestId>/` 配下に出ることを実機確認済み(KIRO_API_KEY 漏洩なし、`ok:true`)。設計メモは `blog/verification.md`(リポジトリ外)。
