@@ -3,11 +3,13 @@
 FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
 # awscli(Secrets 取得・S3 put)・python3(フックサーバ)・kiro-cli 実行に要るツール。
-# curl は Kiro の shell ツールが天気取得で使う。unzip/tar は配布 zip の展開用、
-# ca-certificates は HTTPS 取得に必須。
-RUN dnf install -y python3 awscli-2 curl unzip tar ca-certificates \
-    || dnf install -y python3 awscli curl unzip tar ca-certificates; \
-    dnf clean all
+# unzip/tar は配布 zip の展開用、ca-certificates は HTTPS 取得に必須。
+# curl は dnf で入れない: フル版 curl は AL2023 プリインストールの curl-minimal と
+# 衝突し dnf 全体が失敗する(実機ビルドで確認)。Kiro の HTTP 取得は curl-minimal で足りる。
+# フル curl がどうしても要る場合のみ `dnf install -y --allowerasing curl` を別 RUN で行う。
+RUN { dnf install -y python3 awscli-2 unzip tar ca-certificates \
+      || dnf install -y python3 awscli unzip tar ca-certificates; } \
+    && dnf clean all
 
 # kiro-cli の配布 URL(既定値集約用の定数)。
 # AL2023 の glibc は 2.34 で、gnu ビルドの要求 2.39 に満たないため musl ビルドを使う
