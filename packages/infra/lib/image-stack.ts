@@ -81,8 +81,11 @@ export class ImageStack extends cdk.Stack {
         },
         microvmHooks: {
           run: "ENABLED",
-          // Kiro 実行(ゲスト timeout 840)+ S3 put の余白を見た値。
-          runTimeoutInSeconds: 900,
+          // RunTimeoutInSeconds は上限 60 秒(サービスモデル min=1/max=60)。
+          // 非同期モデルでは /run は Kiro をバックグラウンド起動して即 200 を返すので
+          // 60 で十分。Kiro の実行時間は MicroVM 寿命(run-microvm の
+          // --maximum-duration-in-seconds)が担保する。
+          runTimeoutInSeconds: 60,
         },
       },
       logging: {

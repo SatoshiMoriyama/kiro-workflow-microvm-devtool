@@ -155,6 +155,15 @@ Phase2 設計（`.agents/tasks/design.md`）の調査で以下が確定した。
 - BUILD_VERSION: 実測 2.35.0（gnu/musl とも）。`latest` は時点依存のため版は BUILD-INFO で記録する運用。
 - `install.sh` 挙動: `Q_INSTALL_GLOBAL=1` で `kiro-cli` / `kiro-cli-chat` / `kiro-cli-term` を `/usr/local/bin` に導入。`Q_SKIP_SETUP=1` で setup / dotfiles 連携をスキップ = ビルド時に認証を焼かない（API キー認証が優先順位で無視される事故を回避）。
 
+## 非同期実行モデル（2026 実機デプロイで確定）
+
+実機 `cdk deploy` で `/run` の `RunTimeoutInSeconds` が上限 60 秒であることが判明した（`#/Hooks/MicrovmHooks/RunTimeoutInSeconds: not less or equal to 60`）。サービスモデルでも `MicrovmHooksRunTimeoutInSecondsInteger` は min=1/max=60。よって `/run` 内で Kiro を同期実行する旧設計は成立しない。
+
+- **`/run` フック**: Kiro 実行+S3 put 一式をバックグラウンドスレッドで起動し、即 200（`{"status":"accepted"}`）を返す。`/run` の `RunTimeoutInSeconds`=60 は「200 を返すまでの時間」であり、即返すので 60 で足りる。
+- **Kiro 本体**: MicroVM が生きている限りバックグラウンドで走り、完了時に成果物・`kiro-stdout.txt`・`status.json` を S3 に put する。
+- **ホスト（`run.sh`）**: `status.json` の出現をポーリングして完了を検知する。
+- **時間制約の階層（単調）**: `/run` 60s（受理のみ） / ゲスト Kiro timeout = `KIRO_TIMEOUT_SECONDS`（`hook_server.py` 既定 1200、環境変数で上書き可） / VM 寿命 `--maximum-duration-in-seconds`=1800（`run.sh`、Kiro 実行時間を担保） / ホストポーリング上限=1860s。`KIRO_TIMEOUT_SECONDS(1200) < --maximum-duration(1800) < ホストポーリング上限(1860)` を保つ。旧同期設計の `840 < 900 < 1200 < 1260` はこの非同期設計に置き換えた。
+
 ## Phase2 の残課題（実機検証＝ユーザー実施）
 
 静的検証（synth / tsc / bash -n / py_compile / 単体テスト）は本ワークフローで通した。以下は実 AWS 上でのみ確認できる。
@@ -162,7 +171,8 @@ Phase2 設計（`.agents/tasks/design.md`）の調査で以下が確定した。
 - エージェント設定 JSON（`~/.kiro/agents/*.json`）の `tools` / `permissions` の正確なスキーマ。現状は設定ファイルを置かず `--trust-all-tools` 単独で進める。不足が判明したら最小 JSON を追加する段階対応。
 - `--trust-all-tools` 単独で shell（curl）/ fs / web が承認待ちなしで通るか。
 - API キーで使えるツール・モデルの可用性。
-- `minimumMemoryInMiB=2048` / `runTimeoutInSeconds=900` の妥当性（OOM しないか、天気取得＋HTML 生成が時間内に収まるか）。余れば下げる。
+- `minimumMemoryInMiB=2048` の妥当性（OOM しないか）。余れば下げる。
+- 非同期モデルで天気取得＋HTML 生成が VM 寿命（`--maximum-duration-in-seconds`=1800）内に収まるか。収まれば下げる。`/run` の `RunTimeoutInSeconds`=60 は即 200 を返すだけなので実行時間とは無関係。
 
 ## 参考
 

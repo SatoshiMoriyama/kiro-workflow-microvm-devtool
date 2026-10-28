@@ -41,22 +41,28 @@ RUN_HOOK_PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"requestId":sy
 
 echo "[run] request=$REQUEST_ID prefix=s3://$RESULT_BUCKET/$PREFIX"
 
+# 非同期モデル: /run は Kiro をバックグラウンド起動して即 200 を返す。Kiro は
+# MicroVM が生きている限り裏で走り、完了時に status.json を S3 に put する。
+# --maximum-duration-in-seconds が MicroVM の寿命 = Kiro 実行時間を担保する。
+# 単調関係: KIRO_TIMEOUT_SECONDS(hook_server 既定 1200)
+#          < --maximum-duration(1800) < ホストポーリング上限(1860s)。
 MICROVM_ID="$(aws lambda-microvms run-microvm \
   --image-identifier "$IMAGE_ARN" \
   --execution-role-arn "$EXEC_ROLE_ARN" \
   --egress-network-connectors "[\"$INTERNET_EGRESS_ARN\"]" \
   --run-hook-payload "$RUN_HOOK_PAYLOAD" \
-  --maximum-duration-in-seconds 1200 \
+  --maximum-duration-in-seconds 1800 \
   --query microvmId --output text)"
 echo "[run] microvm=$MICROVM_ID"
 
 trap 'aws lambda-microvms terminate-microvm --microvm-identifier "$MICROVM_ID" >/dev/null 2>&1 || true' EXIT
 
-# /run フックが status.json を put するのを待つ(最大 1260s = 252 x 5s)。
+# バックグラウンドの Kiro が status.json を put するのを待つ(最大 1860s = 372 x 5s)。
+# --maximum-duration(1800s)より少し長くし、VM が寿命で終わるまで待てるようにする。
 # status.json は成否に関わらず実行完了後に必ず出るので完了条件にする。
 STATUS_KEY="${PREFIX}status.json"
 FOUND=""
-for _ in $(seq 1 252); do
+for _ in $(seq 1 372); do
   if aws s3api head-object --bucket "$RESULT_BUCKET" --key "$STATUS_KEY" >/dev/null 2>&1; then
     FOUND="$STATUS_KEY"
     break

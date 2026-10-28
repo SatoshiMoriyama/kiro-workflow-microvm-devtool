@@ -6,9 +6,13 @@ Lambda MicroVM のライフサイクルフックを HTTP で受ける常駐プ�
 - GET/POST /aws/lambda-microvms/runtime/v1/ready
     ビルド時。即 200 を返す(初期化完了シグナル -> スナップショット取得)。
 - GET/POST /aws/lambda-microvms/runtime/v1/run
-    run-microvm 後に 1 回呼ばれる。Secrets Manager から KIRO_API_KEY を取得し、
-    `kiro-cli chat --trust-all-tools --no-interactive "<prompt>"` を同期実行して、
-    生成ファイル・stdout・status.json を S3 prefix 配下へ put してから 200/500 を返す。
+    run-microvm 後に 1 回呼ばれる。/run の RunTimeoutInSeconds は上限 60 秒のため、
+    Kiro をここで同期実行はできない。Secrets Manager からのキー取得 →
+    `kiro-cli chat --trust-all-tools --no-interactive "<prompt>"` 実行 →
+    生成ファイル・stdout・status.json の S3 put 一式をバックグラウンドスレッドで
+    起動し、即 200({"status":"accepted"})を返す。Kiro は MicroVM が生きている限り
+    裏で走り、完了時に status.json を S3 に put する。ホスト(run.sh)は status.json の
+    出現をポーリングして完了を検知する。
 
 成果物は環境変数 RESULT_BUCKET のバケットの prefix(runs/<requestId>/)配下に置く。
 KIRO_API_KEY の値は CloudWatch Logs・S3 成果物・status.json・レスポンスに一切出さない。
@@ -22,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 READY_PATH = "/aws/lambda-microvms/runtime/v1/ready"
@@ -34,9 +39,14 @@ DEFAULT_PROMPT = "札幌の天気を調べて weather.html を作って"
 # ゲスト内で kiro-cli を実行する作業ディレクトリのベース。
 WORKDIR_BASE = "/tmp/kiro-work"
 
-# タイムアウト階層の内側(ゲスト kiro-cli プロセス)。設計の確定値。
-# 840 < /run 900 < VM 寿命 1200 < ホストポーリング 1260。
-KIRO_TIMEOUT_SECONDS = 840
+# ゲスト kiro-cli プロセスの timeout(秒)。非同期モデルでは /run の 60 秒上限から
+# 独立し、MicroVM 寿命(run.sh の --maximum-duration-in-seconds)に収まる値にする。
+# 単調関係: KIRO_TIMEOUT_SECONDS < VM 寿命(--maximum-duration) < ホストポーリング上限。
+# 既定 1200。環境変数 KIRO_TIMEOUT_SECONDS で上書き可能。
+try:
+    KIRO_TIMEOUT_SECONDS = int(os.environ.get("KIRO_TIMEOUT_SECONDS", "1200"))
+except ValueError:
+    KIRO_TIMEOUT_SECONDS = 1200
 
 # 成果物として put しない予約名。
 RESERVED_NAMES = {"kiro-stdout.txt", "status.json"}
@@ -474,37 +484,36 @@ class HookHandler(BaseHTTPRequestHandler):
                 f"run hook -> microvmId={microvm_id!r} "
                 f"prefix={prefix!r} requestId={request_id!r}"
             )
-            try:
-                ok, status = run_kiro_and_upload(
-                    prefix, request_id or microvm_id, prompt
-                )
-            except Exception as exc:  # noqa: BLE001
-                # RESULT_BUCKET 未設定など致命。キー値は env にしか無いので
-                # 例外文字列に混ざらない想定だが念のためパターンマスクのみ通す。
-                detail = mask_secret(str(exc), None)
+            # 非同期モデル: /run の RunTimeoutInSeconds は上限 60 秒のため Kiro を
+            # ここで待てない。線引きは次のとおり。
+            #   - バックグラウンド起動"前"に判明する前提エラー(即時に判定でき、
+            #     status すら書けないもの。例: RESULT_BUCKET 未設定)は /run を 500。
+            #   - Kiro 実行やキー取得の失敗など"実行時"の成否は従来どおり
+            #     run_kiro_and_upload がバックグラウンドで status.json に記録する。
+            #     /run 自体は受理成功として 200({"status":"accepted"})を返す。
+            # 完了検知・成否判定はホスト側が status.json(ok/exitCode/timedOut/
+            # failedUploads)で行う。
+            bucket = os.environ.get("RESULT_BUCKET", "").strip()
+            if not bucket:
+                # status も put できない前提エラー。即時に判定できるので 500。
+                detail = "RESULT_BUCKET is not set"
                 log(f"run hook -> ERROR {detail}")
                 self._respond(500, {"status": "error", "detail": detail})
                 return
-            if ok:
-                log(f"run hook -> done exitCode={status.get('exitCode')}")
-                self._respond(
-                    200,
-                    {
-                        "status": "done",
-                        "exitCode": status.get("exitCode"),
-                        "artifacts": status.get("artifacts", []),
-                    },
-                )
-            else:
-                log(f"run hook -> error exitCode={status.get('exitCode')}")
-                self._respond(
-                    500,
-                    {
-                        "status": "error",
-                        "exitCode": status.get("exitCode"),
-                        "timedOut": status.get("timedOut"),
-                    },
-                )
+
+            def _background(prefix=prefix, request_id=request_id,
+                            microvm_id=microvm_id, prompt=prompt):
+                # バックグラウンド実行の戻り(ok/status)で HTTP ステータスは決めない。
+                # 成否は run_kiro_and_upload が status.json に書く。例外は握りつぶさず
+                # ログに出す(キー値は env にしか無いが念のためパターンマスクを通す)。
+                try:
+                    run_kiro_and_upload(prefix, request_id or microvm_id, prompt)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"run hook background -> ERROR {mask_secret(str(exc), None)}")
+
+            threading.Thread(target=_background, daemon=True).start()
+            log("run hook -> accepted (background started)")
+            self._respond(200, {"status": "accepted"})
             return
         # 未知パスは 404
         self._respond(404, {"status": "not_found", "path": path})

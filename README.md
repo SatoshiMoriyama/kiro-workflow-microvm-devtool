@@ -35,13 +35,18 @@ Phase1 は「MicroVM が起動して結果を S3 に吐く」最小疎通（echo
 ## 設計上の要点
 
 - **CDK で作れるのは MicroVM イメージまで**。実行インスタンス(`Microvm`)は CFN リソースに無く、`run-microvm` API で起動する。よって起動は `scripts/run.sh`。
-- **実行モデル(Phase2)**: Dockerfile の CMD でフックサーバを常駐 → `/ready` に 200 でスナップショット → `run-microvm` で復帰 → `/run` フックが同期で Kiro CLI を実行 → 生成ファイル・`kiro-stdout.txt`・`status.json` を S3 prefix 配下へ put してから 200/500 を返す。
+- **実行モデル(Phase2・非同期)**: Dockerfile の CMD でフックサーバを常駐 → `/ready` に 200 でスナップショット → `run-microvm` で復帰 → `/run` フックは Kiro CLI 実行+S3 put 一式をバックグラウンドスレッドで起動し即 200(`{"status":"accepted"}`)を返す。`/run` の `RunTimeoutInSeconds` は上限 60 秒のため Kiro をここで同期実行できない。Kiro は MicroVM が生きている限り裏で走り、完了時に生成ファイル・`kiro-stdout.txt`・`status.json` を S3 prefix 配下へ put する。ホスト(`run.sh`)は `status.json` の出現をポーリングして完了を検知する(成否は `status.json` の `ok`/`exitCode`/`timedOut`/`failedUploads` で判定)。`RESULT_BUCKET` 未設定などバックグラウンド起動前に判明する前提エラーのみ `/run` を 500 にする。
 - **Kiro CLI(musl 版)**: Dockerfile は `kirocli-aarch64-linux-musl.zip` を導入する。AL2023 の glibc は 2.34 で gnu ビルドの要求 2.39 に満たないため(install.sh の glibc 検査で弾かれる)、静的リンクの musl ビルドを使う。認証は焼かない(`Q_SKIP_SETUP=1`)。
 - **KIRO_API_KEY の渡し方**: 実キーは IaC/イメージに焼かない。`image-stack.ts` が env `KIRO_API_KEY_SECRET_ARN`(Secret `kiro-phase1/kiro-api-key` の ARN のみ)を注入し、`/run` 実行時に executionRole の短命 credential でゲストが `aws secretsmanager get-secret-value` して取得する。値は CloudWatch Logs・S3 成果物・`status.json`・ホスト stdout のいずれにも出さない(二段マスク: 実キー値の完全一致置換 + `ksk_\S+` パターン置換)。
 - **`--trust-all-tools` の安全柵**: 人のいないゲストで承認待ちを出さないため全許可にする。承認は安全柵にならないので、代わりに executionRole の最小権限(result バケットへの put と当該 Secret の read のみ)と egress 制御(INTERNET_EGRESS)が安全柵を担う。
-- **タイムアウト階層(単調 `840 < 900 < 1200 < 1260`)**: ゲスト `kiro-cli` timeout=840(`hook_server.py`)< `/run` `runTimeoutInSeconds`=900(`image-stack.ts`)< MicroVM `--maximum-duration-in-seconds`=1200(`run.sh`)< ホストポーリング上限=1260s(252×5s, `run.sh`)。これで「ゲスト timeout でも status.json を書ける」「VM 寿命切れ前にフック完了」「ポーリングが VM 寿命より先に諦めない」を同時に満たす。
+- **時間制約の階層(非同期)**: 2 つの時間制約は別物。
+  - `/run` の `RunTimeoutInSeconds`=60(`image-stack.ts`): `/run` が 200 を返すまでの上限(サービスモデル max=60)。即 200 を返すので 60 で十分。
+  - ゲスト `kiro-cli` timeout = `KIRO_TIMEOUT_SECONDS`(`hook_server.py` 既定 1200、環境変数で上書き可)。
+  - MicroVM 寿命 `--maximum-duration-in-seconds`=1800(`run.sh`): バックグラウンドの Kiro 実行時間を担保する。
+  - ホストポーリング上限=1860s(372×5s, `run.sh`): VM 寿命より少し長く待つ。
+  - 単調関係 `KIRO_TIMEOUT_SECONDS(1200) < --maximum-duration(1800) < ホストポーリング上限(1860)` を保つ。これで「ゲスト timeout でも status.json を書ける」「VM 寿命切れ前に Kiro 完了」「ポーリングが VM 寿命より先に諦めない」を同時に満たす。
 - **メモリ**: `minimumMemoryInMiB=2048`。Rust 製 kiro-cli がコンテキスト・ツール実行・子プロセス(curl)を抱えるため、baseline を 2048 にして peak 上限(自動で最大 4x)を確保する。
-- **完了条件**: `run.sh` は `status.json` の出現をポーリングで待つ(成否に関わらず実行完了後に必ず出る)。`status.json` の `ok`(= `exitCode==0 && !timedOut`)と `exitCode` を表示する。
+- **完了条件**: `/run` が即 200 を返した後、`run.sh` は `status.json` の出現をポーリングで待つ(バックグラウンドの Kiro 完了後に成否に関わらず必ず出る)。`status.json` の `ok`(= `exitCode==0 && !timedOut && failedUploads なし`)と `exitCode` を表示する。
 - **認証/権限**: ゲストには executionRole の短命 credential が自動付与され、`aws s3 cp` が直接叩ける。長期キー不要。
 - **code artifact の zip** は CDK 外(`package-image.sh`)で内容ハッシュ付きキー `code/app-<hash>.zip` に置き、ハッシュを `packages/infra/artifact-hash.txt` に書き出す。`ImageStack` はそれを読んで URI を決める。zip が変わればキー(= URI)が変わるので CFN が差分を検知して再ビルドする。
 - **イメージ更新は常に CFN 経由**。CLI の `update-microvm-image` を直接叩くと、指定しなかったプロパティ(環境変数・hooks)が落ちてドリフトするため使わない。
