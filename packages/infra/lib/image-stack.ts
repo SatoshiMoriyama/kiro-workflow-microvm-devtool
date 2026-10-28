@@ -28,14 +28,17 @@ export class ImageStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ImageStackProps) {
     super(scope, id, props);
 
-    // package-image.sh が書き出したハッシュを読む。未生成ならビルド前なのでエラーにする。
+    // package-image.sh が書き出したハッシュを読む。
+    // 未生成でも app のロード(= 他スタックの deploy や synth)は通す必要があるため
+    // ここでは throw しない。ハッシュ未生成のときはプレースホルダキーにしておき、
+    // ImageStack を実際に deploy する前に package-image.sh でハッシュを生成する
+    // 運用にする(deploy.sh が Base -> package-image.sh -> Image の順で保証する)。
+    // プレースホルダのまま deploy すると存在しない zip を指してビルドが
+    // "The artifact was not found in S3." で失敗するので、気付ける。
     const hashFile = path.join(__dirname, "..", "artifact-hash.txt");
-    if (!fs.existsSync(hashFile)) {
-      throw new Error(
-        `artifact-hash.txt が無い。先に scripts/package-image.sh を実行する(${hashFile})`,
-      );
-    }
-    const artifactHash = fs.readFileSync(hashFile, "utf-8").trim();
+    const artifactHash = fs.existsSync(hashFile)
+      ? fs.readFileSync(hashFile, "utf-8").trim()
+      : "PLACEHOLDER-run-package-image-sh-first";
     const artifactKey = `code/app-${artifactHash}.zip`;
 
     const region = cdk.Stack.of(this).region;
