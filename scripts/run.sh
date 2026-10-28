@@ -10,8 +10,8 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-ap-northeast-1}"
 PROFILE="${AWS_PROFILE:-work}"
-STACK="${STACK_NAME:-KiroMicrovmPhase1Base}"
-IMAGE_NAME="${MICROVM_IMAGE_NAME:-kiro-phase1}"
+STACK="${STACK_NAME:-KiroMicrovmBase}"
+IMAGE_NAME="${MICROVM_IMAGE_NAME:-kiro-microvm}"
 
 # prompt は PROMPT 環境変数 or 第1引数で受け、両方無ければデフォルト(hook_server と同一)。
 DEFAULT_PROMPT="札幌の天気を調べて weather.html を作って"
@@ -69,7 +69,7 @@ for _ in $(seq 1 372); do
   fi
   sleep 5
 done
-[[ -n "$FOUND" ]] || { echo "ERROR: status.json なし。CloudWatch Logs(/aws/lambda-microvms/kiro-phase1)を確認。" >&2; exit 1; }
+[[ -n "$FOUND" ]] || { echo "ERROR: status.json なし。CloudWatch Logs(/aws/lambda-microvms/kiro-microvm)を確認。" >&2; exit 1; }
 
 LOCAL_DIR="$LOCAL_DIR_BASE/$REQUEST_ID"
 mkdir -p "$LOCAL_DIR"

@@ -48,10 +48,10 @@ export class ImageStack extends cdk.Stack {
       `arn:aws:lambda:${region}:aws:network-connector:aws-network-connector:${name}`;
     const internetEgressArn = connectorArn("INTERNET_EGRESS");
 
-    const image = new CfnMicrovmImage(this, "KiroPhase1Image", {
-      name: "kiro-phase1",
+    const image = new CfnMicrovmImage(this, "KiroMicrovmImage", {
+      name: "kiro-microvm",
       description:
-        "Phase2: MicroVM 上で Kiro CLI を headless 実行し成果物を S3 に格納する",
+        "MicroVM 上で Kiro CLI を headless 実行し成果物を S3 に格納する",
       baseImageArn,
       baseImageVersion,
       additionalOsCapabilities: [],

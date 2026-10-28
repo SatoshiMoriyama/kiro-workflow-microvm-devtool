@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase2 フックサーバ。
+"""MicroVM フックサーバ。
 
 Lambda MicroVM のライフサイクルフックを HTTP で受ける常駐プロセス。
 

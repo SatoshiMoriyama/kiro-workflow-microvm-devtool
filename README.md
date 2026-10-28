@@ -2,7 +2,7 @@
 
 Lambda MicroVMs 上で Kiro を動かすための開発ツール。pnpm モノレポ。
 
-Phase1 は「MicroVM が起動して結果を S3 に吐く」最小疎通（echo）。Phase2 で echo を Kiro CLI の headless 実行に置き換え、指示タスク（例: 札幌の天気を調べて HTML を作る）の成果物を S3 に格納する。
+MicroVM の中で Kiro CLI を headless 実行し、指示タスク（例: 札幌の天気を調べて HTML を作る）の成果物を S3 に格納する。
 
 ## 構成
 
@@ -22,7 +22,7 @@ Phase1 は「MicroVM が起動して結果を S3 に吐く」最小疎通（echo
 │  ├─ deploy.sh                 # Base -> zip 投入 -> Image を 1 コマンドで(pnpm deploy)
 │  ├─ package-image.sh          # packages/image を zip 化し artifact バケットへ
 │  └─ run.sh                    # run-microvm -> 結果をポーリング回収 -> terminate
-└─ phase1-verification.md       # 調査メモ(Kiro headless / 回収 / 承認)
+└─ verification.md              # 調査メモ(Kiro headless / 回収 / 承認)
 ```
 
 ## 前提
@@ -36,9 +36,9 @@ Phase1 は「MicroVM が起動して結果を S3 に吐く」最小疎通（echo
 ## 設計上の要点
 
 - **CDK で作れるのは MicroVM イメージまで**。実行インスタンス(`Microvm`)は CFN リソースに無く、`run-microvm` API で起動する。よって起動は `scripts/run.sh`。
-- **実行モデル(Phase2・非同期)**: Dockerfile の CMD でフックサーバを常駐 → `/ready` に 200 でスナップショット → `run-microvm` で復帰 → `/run` フックは Kiro CLI 実行+S3 put 一式をバックグラウンドスレッドで起動し即 200(`{"status":"accepted"}`)を返す。`/run` の `RunTimeoutInSeconds` は上限 60 秒のため Kiro をここで同期実行できない。Kiro は MicroVM が生きている限り裏で走り、完了時に生成ファイル・`kiro-stdout.txt`・`status.json` を S3 prefix 配下へ put する。ホスト(`run.sh`)は `status.json` の出現をポーリングして完了を検知する(成否は `status.json` の `ok`/`exitCode`/`timedOut`/`failedUploads` で判定)。`RESULT_BUCKET` 未設定などバックグラウンド起動前に判明する前提エラーのみ `/run` を 500 にする。
+- **実行モデル(非同期)**: Dockerfile の CMD でフックサーバを常駐 → `/ready` に 200 でスナップショット → `run-microvm` で復帰 → `/run` フックは Kiro CLI 実行+S3 put 一式をバックグラウンドスレッドで起動し即 200(`{"status":"accepted"}`)を返す。`/run` の `RunTimeoutInSeconds` は上限 60 秒のため Kiro をここで同期実行できない。Kiro は MicroVM が生きている限り裏で走り、完了時に生成ファイル・`kiro-stdout.txt`・`status.json` を S3 prefix 配下へ put する。ホスト(`run.sh`)は `status.json` の出現をポーリングして完了を検知する(成否は `status.json` の `ok`/`exitCode`/`timedOut`/`failedUploads` で判定)。`RESULT_BUCKET` 未設定などバックグラウンド起動前に判明する前提エラーのみ `/run` を 500 にする。
 - **Kiro CLI(musl 版)**: Dockerfile は `kirocli-aarch64-linux-musl.zip` を導入する。AL2023 の glibc は 2.34 で gnu ビルドの要求 2.39 に満たないため(install.sh の glibc 検査で弾かれる)、静的リンクの musl ビルドを使う。認証は焼かない(`Q_SKIP_SETUP=1`)。
-- **KIRO_API_KEY の渡し方**: 実キーは IaC/イメージに焼かない。`image-stack.ts` が env `KIRO_API_KEY_SECRET_ARN`(Secret `kiro-phase1/kiro-api-key` の ARN のみ)を注入し、`/run` 実行時に executionRole の短命 credential でゲストが `aws secretsmanager get-secret-value` して取得する。値は CloudWatch Logs・S3 成果物・`status.json`・ホスト stdout のいずれにも出さない(二段マスク: 実キー値の完全一致置換 + `ksk_\S+` パターン置換)。
+- **KIRO_API_KEY の渡し方**: 実キーは IaC/イメージに焼かない。`image-stack.ts` が env `KIRO_API_KEY_SECRET_ARN`(Secret `kiro-microvm/kiro-api-key` の ARN のみ)を注入し、`/run` 実行時に executionRole の短命 credential でゲストが `aws secretsmanager get-secret-value` して取得する。値は CloudWatch Logs・S3 成果物・`status.json`・ホスト stdout のいずれにも出さない(二段マスク: 実キー値の完全一致置換 + `ksk_\S+` パターン置換)。
 - **`--trust-all-tools` の安全柵**: 人のいないゲストで承認待ちを出さないため全許可にする。承認は安全柵にならないので、代わりに executionRole の最小権限(result バケットへの put と当該 Secret の read のみ)と egress 制御(INTERNET_EGRESS)が安全柵を担う。
 - **時間制約の階層(非同期)**: 2 つの時間制約は別物。
   - `/run` の `RunTimeoutInSeconds`=60(`image-stack.ts`): `/run` が 200 を返すまでの上限(サービスモデル max=60)。即 200 を返すので 60 で十分。
@@ -57,8 +57,8 @@ Phase1 は「MicroVM が起動して結果を S3 に吐く」最小疎通（echo
 
 鶏卵問題(`CfnMicrovmImage` は zip を要求するが deploy 中にビルドまで走るため zip を先に置けない)を避けるため、スタックを2つに分ける。
 
-- `KiroMicrovmPhase1Base`: S3 x2 + IAM x2 + LogGroup(zip 不要)
-- `KiroMicrovmPhase1Image`: `CfnMicrovmImage`(zip 必須)
+- `KiroMicrovmBase`: S3 x2 + IAM x2 + LogGroup(zip 不要)
+- `KiroMicrovmImage`: `CfnMicrovmImage`(zip 必須)
 
 ```bash
 # 1. 依存インストール
@@ -81,16 +81,16 @@ AWS_PROFILE=work pnpm run-microvm -- "東京の天気を調べて weather.html �
 
 個別に叩きたい場合は従来どおり `scripts/deploy.sh`・`scripts/package-image.sh`・`scripts/run.sh` を直接実行してもよい。`pnpm deploy` は内部でこの順序(BaseStack → `package-image.sh` → ImageStack)を実行する。
 
-事前準備: Secret `kiro-phase1/kiro-api-key` に実キーを投入しておく(IaC には焼かない)。
+事前準備: Secret `kiro-microvm/kiro-api-key` に実キーを投入しておく(IaC には焼かない)。
 
 ```bash
 AWS_PROFILE=work aws secretsmanager put-secret-value \
-  --secret-id kiro-phase1/kiro-api-key --secret-string 'ksk_...' --region ap-northeast-1
+  --secret-id kiro-microvm/kiro-api-key --secret-string 'ksk_...' --region ap-northeast-1
 ```
 
 期待結果: `runs/<requestId>/` 配下に `status.json`・`kiro-stdout.txt`・成果物(`weather.html` など)が出る。`run.sh` は `status.json` の出現を待ち、`ok` と `exitCode` を表示して `results/<requestId>/` に回収する。`ksk_` で始まる文字列は CloudWatch Logs・S3 の全オブジェクト・ホスト stdout のいずれにも出ない。
 
-kiro-cli の配布 URL や版を変えるときは、`run-microvm` が AWS 側ビルドのため build-arg 経路が無い。`packages/image/Dockerfile` の `ARG KIRO_CLI_DL_URL` 既定値を直接編集 → 手順 4(`package-image.sh`)→ 手順 5(`cdk deploy KiroMicrovmPhase1Image`)で再ビルドする。
+kiro-cli の配布 URL や版を変えるときは、`run-microvm` が AWS 側ビルドのため build-arg 経路が無い。`packages/image/Dockerfile` の `ARG KIRO_CLI_DL_URL` 既定値を直接編集 → 手順 4(`package-image.sh`)→ 手順 5(`cdk deploy KiroMicrovmImage`)で再ビルドする。
 
 ## 検証状況
 
@@ -106,4 +106,4 @@ kiro-cli の配布 URL や版を変えるときは、`run-microvm` が AWS 側�
 - 出力例: `hello from microvm 2026-10-27T20:23:43.780973+00:00`
 - `run-microvm` レスポンスの識別子は `microvmId`。
 
-Phase1 完了。次は同じ構成に Kiro CLI を載せる(phase1-verification.md の設計)。
+その後 echo を Kiro CLI の headless 実行に置き換え、「札幌の天気を調べて weather.html を作って」で成果物が `runs/<requestId>/` 配下に出ることを実機確認済み(KIRO_API_KEY 漏洩なし、`ok:true`)。設計メモは verification.md。

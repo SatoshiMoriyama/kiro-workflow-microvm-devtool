@@ -10,18 +10,18 @@ const env = {
   region: process.env.CDK_DEFAULT_REGION ?? "ap-northeast-1",
 };
 
-// 基盤(バケット/IAM/ログ)。zip 不要で先にデプロイできる。
-const base = new BaseStack(app, "KiroMicrovmPhase1Base", {
+// 基盤(バケット/IAM/ログ/Secret)。zip 不要で先にデプロイできる。
+const base = new BaseStack(app, "KiroMicrovmBase", {
   env,
   description:
-    "Phase1 基盤: S3 x2 + IAM x2 + LogGroup。zip 投入前にデプロイする。",
+    "基盤: S3 x2 + IAM x2 + LogGroup + Secret。zip 投入前にデプロイする。",
 });
 
 // MicroVM イメージ。zip 投入後にデプロイする(順序が重要)。
-const image = new ImageStack(app, "KiroMicrovmPhase1Image", {
+const image = new ImageStack(app, "KiroMicrovmImage", {
   env,
   description:
-    "Phase1 イメージ: CfnMicrovmImage。BaseStack デプロイ + zip 投入後にデプロイ。",
+    "イメージ: CfnMicrovmImage。BaseStack デプロイ + zip 投入後にデプロイ。",
   artifactBucket: base.artifactBucket,
   resultBucket: base.resultBucket,
   buildRole: base.buildRole,

@@ -18,7 +18,7 @@ HASH_FILE="$ROOT/packages/infra/artifact-hash.txt"
 aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-kiro-phase1-artifact-${ACCOUNT}-${REGION}}"
+ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-kiro-microvm-artifact-${ACCOUNT}-${REGION}}"
 
 echo "[package-image] artifact bucket = $ARTIFACT_BUCKET"
 
@@ -41,4 +41,4 @@ aws s3 cp "$TMP_ZIP" "s3://$ARTIFACT_BUCKET/$KEY"
 
 echo "$HASH" > "$HASH_FILE"
 echo "[package-image] ハッシュを記録: $HASH_FILE"
-echo "[package-image] 完了。次に: cdk deploy KiroMicrovmPhase1Image"
+echo "[package-image] 完了。次に: cdk deploy KiroMicrovmImage"

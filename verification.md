@@ -1,11 +1,11 @@
-# Phase1 検証メモ — MicroVM で Kiro を API キー起動し「今日の天気は？」に答えさせる
+# 検証メモ — MicroVM で Kiro を API キー起動し「今日の天気は？」に答えさせる
 
 調査日: 2026-10-27
 目的: Lambda MicroVM 上で Kiro を非対話で起動し、「今日の天気は？」→ 天気取得 → 回答取得、までを回す最小 PoC の前提整理。
 
-## ゴール（Phase1 のスコープ）
+## ゴール（最小スコープ）
 
-MicroVM 内で Kiro CLI を起動 → 「今日の天気は？」を投げる → Kiro が天気を取得 → その回答を手元で受け取る。git clone / push / PR / 通知は Phase2 以降（memo.md 側）。
+MicroVM 内で Kiro CLI を起動 → 「今日の天気は？」を投げる → Kiro が天気を取得 → その回答を手元で受け取る。git clone / push / PR / 通知は次段階（memo.md 側）。
 
 ## 結論: API キー 1 個で起動できる（ヘッドレス前提の正解）
 
@@ -43,7 +43,7 @@ kiro-cli chat --trust-all-tools --no-interactive "今日の天気は？"
 - B. Kiro 内蔵 `web_fetch` ツール
   - エージェント設定の `tools` に含まれていれば使える。承認は全許可で通る。
 
-→ Phase1 は A（curl + shell）で進める想定。web_fetch も `tools` に入れておけば併用可。
+→ 当初は A（curl + shell）で進める想定。web_fetch も `tools` に入れておけば併用可。
 
 ## MicroVM 最小構成への落とし込み
 
@@ -127,7 +127,7 @@ aws s3 cp s3://<bucket>/runs/<id>/weather.html ./weather.html
 
 全許可にすると、承認はもう安全柵として機能しない。MicroVM 隔離の内側なのでホストへの波及は無いが、残るリスクは別レイヤー:
 
-- **egress 全開**: ゲストから外部へ何でも投げられる。シークレット（`KIRO_API_KEY`、Phase2 の git トークン）をゲスト env に置くので、全許可の Kiro がそれをログ・成果物・外部に出さないよう、出力にシークレットを混ぜない（memo.md 既出。全許可だと一層効く）。
+- **egress 全開**: ゲストから外部へ何でも投げられる。シークレット（`KIRO_API_KEY`、将来の git トークン）をゲスト env に置くので、全許可の Kiro がそれをログ・成果物・外部に出さないよう、出力にシークレットを混ぜない（memo.md 既出。全許可だと一層効く）。
 - **execution role の権限範囲**: ゲストには execution role の短命 credential が入り(memo.md 3章)、Kiro が `aws` を自由に叩ける。全許可の実害はツール承認ではなく **IAM 権限の広さ**で決まる。execution role を対象 S3 プレフィックス等に最小権限で絞るのが実質の安全柵。
 
 完了 ≠ 成功。exit 0 でも的外れな HTML を作って終わる可能性はあるので、回収後に中身を検品する。
@@ -140,16 +140,16 @@ aws s3 cp s3://<bucket>/runs/<id>/weather.html ./weather.html
 2. イメージ化: 上記が通る構成を Dockerfile に固める。
 3. MicroVM 化: `create-microvm-image` → `run-microvm`(SHELL_INGRESS + INTERNET_EGRESS) → シェル接続 → 実行 → 回答回収。
 
-## 未確認・要対応（Phase1 を始める前のブロッカー）
+## 未確認・要対応（着手前のブロッカー）
 
 - Kiro の API キーを保有しているか（無いと PoC 開始不可）。
 - 天気取得は A（curl wttr.in）でよいか。対象都市（例: 東京）。
 - AWS CLI 認証・リージョン、当該アカウントで `aws lambda-microvms` が使えるか（新機能のため要確認）。
 - API キーで `shell`/`web_fetch` と対象モデルが実際に使えるか（実機検証）。
 
-## Phase2 で確定した事項（2026-10-28 追記）
+## kiro-cli 導入で確定した事項（2026-10-28 追記）
 
-Phase2 設計（`.agents/tasks/design.md`）の調査で以下が確定した。
+Kiro CLI を載せる設計（`.agents/tasks/design.md`）の調査で以下が確定した。
 
 - 配布 URL と musl 選択: `https://desktop-release.q.us-east-1.amazonaws.com/latest/` が公式配布パス。gnu ビルドは install.sh の glibc 検査で 2.39 以上を要求するが AL2023 は 2.34 のため弾かれ、"musl 版を使え" と案内される。静的リンクの `kirocli-aarch64-linux-musl.zip` を採用。
 - BUILD_VERSION: 実測 2.35.0（gnu/musl とも）。`latest` は時点依存のため版は BUILD-INFO で記録する運用。
@@ -164,7 +164,7 @@ Phase2 設計（`.agents/tasks/design.md`）の調査で以下が確定した。
 - **ホスト（`run.sh`）**: `status.json` の出現をポーリングして完了を検知する。
 - **時間制約の階層（単調）**: `/run` 60s（受理のみ） / ゲスト Kiro timeout = `KIRO_TIMEOUT_SECONDS`（`hook_server.py` 既定 1200、環境変数で上書き可） / VM 寿命 `--maximum-duration-in-seconds`=1800（`run.sh`、Kiro 実行時間を担保） / ホストポーリング上限=1860s。`KIRO_TIMEOUT_SECONDS(1200) < --maximum-duration(1800) < ホストポーリング上限(1860)` を保つ。旧同期設計の `840 < 900 < 1200 < 1260` はこの非同期設計に置き換えた。
 
-## Phase2 の残課題（実機検証＝ユーザー実施）
+## 残課題（実機検証＝ユーザー実施）
 
 静的検証（synth / tsc / bash -n / py_compile / 単体テスト）は本ワークフローで通した。以下は実 AWS 上でのみ確認できる。
 

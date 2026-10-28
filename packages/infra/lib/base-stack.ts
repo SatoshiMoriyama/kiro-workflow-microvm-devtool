@@ -6,13 +6,14 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 
 /**
- * Phase1 基盤スタック(zip 不要で先にデプロイできるもの)。
+ * 基盤スタック(zip 不要で先にデプロイできるもの)。
  *
  *  - artifact バケット(code artifact の zip 置き場。固定名でデプロイ前から参照可)
- *  - result バケット(MicroVM が echo 結果を吐く先)
+ *  - result バケット(MicroVM が成果物を吐く先)
  *  - buildRole(イメージビルド時に assume)
  *  - executionRole(実行時に MicroVM が assume)
  *  - CloudWatch LogGroup
+ *  - KIRO_API_KEY の器(Secrets Manager)
  *
  * これを deploy -> scripts/package-image.sh で zip 投入 -> ImageStack を deploy、の順で
  * 「artifact が S3 に無い」ビルド失敗を避ける。
@@ -35,7 +36,7 @@ export class BaseStack extends cdk.Stack {
     // artifact バケットは固定名にして、ImageStack デプロイ前に
     // package-image.sh が URI を組み立てられるようにする。
     this.artifactBucket = new s3.Bucket(this, "ArtifactBucket", {
-      bucketName: `kiro-phase1-artifact-${account}-${region}`,
+      bucketName: `kiro-microvm-artifact-${account}-${region}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
@@ -44,7 +45,7 @@ export class BaseStack extends cdk.Stack {
     });
 
     this.resultBucket = new s3.Bucket(this, "ResultBucket", {
-      bucketName: `kiro-phase1-result-${account}-${region}`,
+      bucketName: `kiro-microvm-result-${account}-${region}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
@@ -53,7 +54,7 @@ export class BaseStack extends cdk.Stack {
     });
 
     this.logGroup = new logs.LogGroup(this, "MicrovmLogGroup", {
-      logGroupName: `/aws/lambda-microvms/kiro-phase1`,
+      logGroupName: `/aws/lambda-microvms/kiro-microvm`,
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
@@ -69,7 +70,7 @@ export class BaseStack extends cdk.Stack {
     // 実キーは後から `aws secretsmanager put-secret-value` で上書きする。
     // 実キーは IaC/テンプレート/git に一切載せない。
     this.apiKeySecret = new secretsmanager.Secret(this, "KiroApiKeySecret", {
-      secretName: "kiro-phase1/kiro-api-key",
+      secretName: "kiro-microvm/kiro-api-key",
       description: "Kiro CLI の KIRO_API_KEY(値は put-secret-value で後から投入)",
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
@@ -85,20 +86,20 @@ export class BaseStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, "ArtifactBucketName", {
       value: this.artifactBucket.bucketName,
-      exportName: "KiroPhase1-ArtifactBucketName",
+      exportName: "KiroMicrovm-ArtifactBucketName",
     });
     new cdk.CfnOutput(this, "ArtifactKey", { value: this.artifactKey });
     new cdk.CfnOutput(this, "ResultBucketName", {
       value: this.resultBucket.bucketName,
-      exportName: "KiroPhase1-ResultBucketName",
+      exportName: "KiroMicrovm-ResultBucketName",
     });
     new cdk.CfnOutput(this, "ExecutionRoleArn", {
       value: this.executionRole.roleArn,
-      exportName: "KiroPhase1-ExecutionRoleArn",
+      exportName: "KiroMicrovm-ExecutionRoleArn",
     });
     new cdk.CfnOutput(this, "ApiKeySecretArn", {
       value: this.apiKeySecret.secretArn,
-      exportName: "KiroPhase1-ApiKeySecretArn",
+      exportName: "KiroMicrovm-ApiKeySecretArn",
     });
     new cdk.CfnOutput(this, "LogGroupName", {
       value: this.logGroup.logGroupName,
