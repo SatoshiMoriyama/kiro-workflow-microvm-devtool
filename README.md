@@ -19,6 +19,7 @@ Phase1 は「MicroVM が起動して結果を S3 に吐く」最小疎通（echo
 │     ├─ hook_server.py         # /ready に 200、/run で Kiro CLI 実行 -> 成果物+status.json を S3 に put
 │     └─ test_hook_server.py    # hook_server の純関数ユニットテスト
 ├─ scripts/
+│  ├─ deploy.sh                 # Base -> zip 投入 -> Image を 1 コマンドで(pnpm deploy)
 │  ├─ package-image.sh          # packages/image を zip 化し artifact バケットへ
 │  └─ run.sh                    # run-microvm -> 結果をポーリング回収 -> terminate
 └─ phase1-verification.md       # 調査メモ(Kiro headless / 回収 / 承認)
@@ -66,23 +67,19 @@ pnpm install
 # 2. (初回のみ) CDK bootstrap
 AWS_PROFILE=work pnpm --filter infra exec cdk bootstrap aws://495236580548/ap-northeast-1
 
-# 3. 基盤を先にデプロイ(artifact バケットは固定名で作られる)
-AWS_PROFILE=work pnpm --filter infra exec cdk deploy KiroMicrovmPhase1Base
+# 3. デプロイ(Base -> zip 投入 -> Image を 1 コマンドで。scripts/deploy.sh)
+#    image の中身を変えても再実行すれば CFN が差分を検知して再ビルドする。
+AWS_PROFILE=work pnpm deploy
 
-# 4. code artifact を zip 化し、ハッシュ付きキーで投入(artifact-hash.txt も生成)
-AWS_PROFILE=work ./scripts/package-image.sh
-
-# 5. zip が置かれた状態でイメージをデプロイ(ここでビルドが走る。数分)
-#    image の中身を変えたら 4 -> 5 をやり直せば CFN が再ビルドする
-AWS_PROFILE=work pnpm --filter infra exec cdk deploy KiroMicrovmPhase1Image
-
-# 6. MicroVM を起動して Kiro を実行し、成果物を回収する
-#    prompt は PROMPT 環境変数か第1引数で渡す。省略時はデフォルト
+# 4. MicroVM を起動して Kiro を実行し、成果物を回収する
+#    prompt は PROMPT 環境変数か引数(-- で渡す)で指定。省略時はデフォルト
 #    (札幌の天気を調べて weather.html を作って)。
-AWS_PROFILE=work ./scripts/run.sh
-AWS_PROFILE=work PROMPT="東京の天気を調べて weather.html を作って" ./scripts/run.sh
-AWS_PROFILE=work ./scripts/run.sh "東京の天気を調べて weather.html を作って"
+AWS_PROFILE=work pnpm run-microvm
+AWS_PROFILE=work PROMPT="東京の天気を調べて weather.html を作って" pnpm run-microvm
+AWS_PROFILE=work pnpm run-microvm -- "東京の天気を調べて weather.html を作って"
 ```
+
+個別に叩きたい場合は従来どおり `scripts/deploy.sh`・`scripts/package-image.sh`・`scripts/run.sh` を直接実行してもよい。`pnpm deploy` は内部でこの順序(BaseStack → `package-image.sh` → ImageStack)を実行する。
 
 事前準備: Secret `kiro-phase1/kiro-api-key` に実キーを投入しておく(IaC には焼かない)。
 

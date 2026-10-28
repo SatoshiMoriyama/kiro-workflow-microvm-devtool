@@ -2,11 +2,13 @@
   "name": "kiro-workflow-microvm-devtool",
   "version": "0.0.0",
   "private": true,
-  "description": "Lambda MicroVMs 上で Kiro を動かすための開発ツール（Phase1: echo -> S3 の最小疎通）",
+  "description": "Lambda MicroVMs 上で Kiro CLI を headless 実行し成果物を S3 に格納する開発ツール",
   "scripts": {
     "build": "pnpm -r build",
     "synth": "pnpm --filter infra synth",
-    "deploy": "pnpm --filter infra deploy"
+    "deploy": "bash scripts/deploy.sh",
+    "run-microvm": "bash scripts/run.sh",
+    "package-image": "bash scripts/package-image.sh"
   },
   "packageManager": "pnpm@12.10.1",
   "engines": {
