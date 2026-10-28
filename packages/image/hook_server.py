@@ -44,8 +44,8 @@ RESERVED_NAMES = {"kiro-stdout.txt", "status.json"}
 # キー形式の保険パターン(第2段マスク)。
 _KSK_PATTERN = re.compile(r"ksk_\S+")
 
-# contains_secret でテキストとして重点チェックする拡張子。
-_TEXT_EXTENSIONS = (".txt", ".html", ".md", ".json", ".log")
+# contains_secret のバイト列検査でキー形式を拾う保険パターン(空白以外を貪欲に)。
+_KSK_PATTERN_BYTES = re.compile(rb"ksk_\S+")
 
 
 def log(msg: str) -> None:
@@ -115,19 +115,22 @@ def name_contains_secret(name, api_key):
 def contains_secret(path, api_key):
     """ファイル内容に実キー値(非空時)または ksk_\\S+ が含まれれば True。
 
-    バイナリ/読取失敗はベストエフォート(例外時 False)。テキスト系拡張子を重点チェック。
+    FR-5 を満たすため fail-closed。バイト列として読み、実キーの UTF-8 バイト列と
+    ksk_ のバイトパターンを検査する(エンコーディング・不正バイトに依存しない)。
+    読取不能(OSError 等)は検査不能として安全側に倒し True を返す(put させず
+    skippedArtifacts に回す)。デコード失敗を「漏洩なし」にしない。
     """
     try:
-        lower = path.lower()
-        is_text_ext = lower.endswith(_TEXT_EXTENSIONS)
-        # テキスト系は厳格に、それ以外もベストエフォートで中身を読む。
-        with open(path, "r", encoding="utf-8", errors="strict" if is_text_ext else "ignore") as fh:
-            content = fh.read()
-    except (OSError, UnicodeDecodeError):
-        return False
-    if api_key and api_key in content:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        # 検査できない = 安全を保証できない。put させない(fail-closed)。
         return True
-    if _KSK_PATTERN.search(content):
+    if api_key:
+        key_bytes = api_key.encode("utf-8", "surrogatepass") if isinstance(api_key, str) else bytes(api_key)
+        if key_bytes and key_bytes in data:
+            return True
+    if _KSK_PATTERN_BYTES.search(data):
         return True
     return False
 

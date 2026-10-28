@@ -151,8 +151,28 @@ class TestContainsSecret(unittest.TestCase):
                 fh.write("nothing sensitive here")
             self.assertFalse(hs.contains_secret(p, None))
 
-    def test_missing_file_false(self):
-        self.assertFalse(hs.contains_secret("/no/such/file.txt", None))
+    def test_unreadable_file_true_fail_closed(self):
+        # 読取不能は検査不能 -> 安全側に倒して True(put させない)。
+        self.assertTrue(hs.contains_secret("/no/such/file.txt", None))
+
+    def test_invalid_utf8_with_key_true(self):
+        # 不正 UTF-8 バイトを含み、かつ実キーのバイト列を含むファイル。
+        # デコードに依存せずバイト列で検知し、put をスキップできること。
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "weather.html")
+            with open(p, "wb") as fh:
+                fh.write(b"<html>\xff\xfe ksk_live123 \x00 end</html>")
+            self.assertTrue(hs.contains_secret(p, None))
+            self.assertTrue(hs.contains_secret(p, "ksk_live123"))
+
+    def test_invalid_utf8_without_key_false(self):
+        # 不正 UTF-8 でもキーを含まなければ put を妨げない。
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "weather.html")
+            with open(p, "wb") as fh:
+                fh.write(b"<html>\xff\xfe nothing sensitive \x00</html>")
+            self.assertFalse(hs.contains_secret(p, None))
+            self.assertFalse(hs.contains_secret(p, "ksk_live123"))
 
 
 class TestNameContainsSecret(unittest.TestCase):
@@ -294,6 +314,28 @@ class TestRunKiroUploadFailures(unittest.TestCase):
         # 安全表記で記録される。
         self.assertIn("<redacted-filename-1>", status["skippedArtifacts"])
         # clean な成果物は従来どおり put される。
+        self.assertIn("weather.html", status["artifacts"])
+
+    def test_invalid_utf8_artifact_with_key_skipped(self):
+        # 不正 UTF-8 バイト + 実キーを含む成果物は put されず skippedArtifacts に入る。
+        bad_name = "report.html"
+        with open(os.path.join(self._workdir.name, bad_name), "wb") as fh:
+            fh.write(b"<html>\xff\xfe ksk_live \x00 end</html>")
+        put_file = unittest.mock.Mock(return_value=(True, "s3://ok"))
+        with self._patch_kiro_exit0(), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/", self._req, "p"
+            )
+        # 危険な成果物は put されない(その key が cp 呼び出しに現れない)。
+        for call in put_file.call_args_list:
+            self.assertNotIn(bad_name, call.args[1])
+        self.assertIn(bad_name, status["skippedArtifacts"])
+        self.assertNotIn(bad_name, status["artifacts"])
+        # 実キー値はどこにも漏れない。
+        self.assertNotIn("ksk_live", json.dumps(status, ensure_ascii=False))
+        # clean な成果物は引き続き put される。
         self.assertIn("weather.html", status["artifacts"])
 
 
