@@ -155,6 +155,22 @@ class TestContainsSecret(unittest.TestCase):
         self.assertFalse(hs.contains_secret("/no/such/file.txt", None))
 
 
+class TestNameContainsSecret(unittest.TestCase):
+    def test_exact_key_value_in_name_true(self):
+        self.assertTrue(hs.name_contains_secret("ksk_live123.html", "ksk_live123"))
+
+    def test_pattern_in_name_true_without_api_key(self):
+        # 実キー値が分からなくても ksk_ パターンで検知する。
+        self.assertTrue(hs.name_contains_secret("report-ksk_abc.txt", None))
+
+    def test_clean_name_false(self):
+        self.assertFalse(hs.name_contains_secret("weather.html", "ksk_live123"))
+        self.assertFalse(hs.name_contains_secret("weather.html", None))
+
+    def test_non_string_name(self):
+        self.assertFalse(hs.name_contains_secret(12345, None))
+
+
 class TestRunKiroUploadFailures(unittest.TestCase):
     """S3 put 失敗が ok=false に反映されることを確認する(設計 §5: 致命)。"""
 
@@ -252,6 +268,32 @@ class TestRunKiroUploadFailures(unittest.TestCase):
         self.assertTrue(ok)
         self.assertTrue(status["ok"])
         self.assertEqual(status["failedUploads"], [])
+        self.assertIn("weather.html", status["artifacts"])
+
+    def test_secret_in_filename_not_uploaded_or_leaked(self):
+        # 実キーをファイル名に埋め込んだ成果物を追加する。
+        leak_name = "ksk_live.html"
+        with open(os.path.join(self._workdir.name, leak_name), "w") as fh:
+            fh.write("<html>clean content</html>")
+        put_file = unittest.mock.Mock(return_value=(True, "s3://ok"))
+        with self._patch_kiro_exit0(), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/", self._req, "p"
+            )
+        # 危険名は put されない(呼ばれた key に元名が出ない)。
+        for call in put_file.call_args_list:
+            key_arg = call.args[1]
+            self.assertNotIn("ksk_live", key_arg)
+        # artifacts/skipped と status 全体に元名も実キー値も出ない。
+        self.assertNotIn(leak_name, status["artifacts"])
+        self.assertNotIn(leak_name, status["skippedArtifacts"])
+        serialized = json.dumps(status, ensure_ascii=False)
+        self.assertNotIn("ksk_live", serialized)
+        # 安全表記で記録される。
+        self.assertIn("<redacted-filename-1>", status["skippedArtifacts"])
+        # clean な成果物は従来どおり put される。
         self.assertIn("weather.html", status["artifacts"])
 
 

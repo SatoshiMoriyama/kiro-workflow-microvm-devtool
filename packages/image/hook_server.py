@@ -12,6 +12,8 @@ Lambda MicroVM のライフサイクルフックを HTTP で受ける常駐プ�
 
 成果物は環境変数 RESULT_BUCKET のバケットの prefix(runs/<requestId>/)配下に置く。
 KIRO_API_KEY の値は CloudWatch Logs・S3 成果物・status.json・レスポンスに一切出さない。
+成果物の内容だけでなくファイル名も検査し、キーを含む名前は S3 key・status・ログ・
+応答のいずれにも出さず固定の安全表記に置換する。
 """
 
 import datetime
@@ -92,6 +94,22 @@ def select_artifacts(workdir):
         result.append(name)
     result.sort()
     return result
+
+
+def name_contains_secret(name, api_key):
+    """ファイル名に実キー値(非空時)または ksk_\\S+ が含まれれば True。
+
+    --trust-all-tools の Kiro はファイル名に API キーを埋め込みうる。名前は
+    S3 key・status.json・ログ・/run 応答へ伝播するため、内容と同じ二段検査を
+    名前にも適用する(FR-5 の非漏洩境界をファイル名が迂回しないように)。
+    """
+    if not isinstance(name, str):
+        name = str(name)
+    if api_key and api_key in name:
+        return True
+    if _KSK_PATTERN.search(name):
+        return True
+    return False
 
 
 def contains_secret(path, api_key):
@@ -381,8 +399,17 @@ def run_kiro_and_upload(prefix, request_id, prompt):
     # ⑥ 成果物を選別し、キー混入チェックに合格したものだけ put
     artifacts = []
     skipped = []
+    redacted_name_count = 0
     for name in select_artifacts(workdir):
         full = os.path.join(workdir, name)
+        # 名前にキーが埋め込まれている場合、元名は S3 key・status・ログ・応答の
+        # どこにも出さない。put もせず、固定の安全表記で skipped に記録する。
+        if name_contains_secret(name, api_key):
+            redacted_name_count += 1
+            safe_name = f"<redacted-filename-{redacted_name_count}>"
+            skipped.append(safe_name)
+            log(f"artifact skipped (secret in filename): {safe_name}")
+            continue
         if contains_secret(full, api_key):
             skipped.append(name)
             log(f"artifact skipped (secret detected): {name}")
