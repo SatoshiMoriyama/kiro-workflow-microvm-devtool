@@ -310,11 +310,23 @@ def is_valid_repo_url(value):
     return bool(isinstance(value, str) and _REPO_URL_PATTERN.match(value))
 
 
+def repo_url_specified(payload):
+    """payload に非空の repoUrl 文字列が入っているかを返す(値の妥当性は問わない)。
+
+    「未指定(= 従来モード)」と「指定ありだが不正(= fail-closed)」を呼び出し側で
+    区別するための判定。resolve_repo_url は両者とも None を返すため、指定の有無は
+    こちらで判定する。
+    """
+    value = payload.get("repoUrl") if isinstance(payload, dict) else None
+    return bool(isinstance(value, str) and value.strip())
+
+
 def resolve_repo_url(payload):
     """payload["repoUrl"] を取り出す。未指定/空/非文字列/不正形式なら None(= clone なし)。
 
     許可形式は https://github.com/ 直下のパスのみ。`@`(userinfo)を含む URL や
     別ホスト・別スキームは拒否し、clone 先を固定して資格情報混入 URL を弾く。
+    不正形式の拒否と未指定の区別が要るときは repo_url_specified を併用する。
     """
     value = payload.get("repoUrl") if isinstance(payload, dict) else None
     if not (isinstance(value, str) and value.strip()):
@@ -339,11 +351,20 @@ def sanitize_branch_component(value):
 
 
 def resolve_base_branch(payload):
-    """payload["baseBranch"] を取り出す。未指定/空/非文字列なら既定 "main"。"""
+    """payload["baseBranch"] を取り出す。未指定/空/非文字列なら既定 "main"。
+
+    値は repoUrl/requestId と一貫して安全な文字(英数と `-_./`)に正規化する。
+    呼び出し元は信頼する前提だが、プロンプトへ補間する値の入力検証を低コストで
+    揃える(危険文字は `-` に置換。正規化後に空なら既定 "main")。
+    """
     value = payload.get("baseBranch") if isinstance(payload, dict) else None
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return DEFAULT_BASE_BRANCH
+    if not (isinstance(value, str) and value.strip()):
+        return DEFAULT_BASE_BRANCH
+    # 安全文字(英数と `-_./`)以外を `-` に置換する。正規化で中身が無くなる
+    # (記号のみ等)なら既定 "main" に倒す。sanitize_branch_component の "run"
+    # フォールバックは requestId 用のため、baseBranch では自前で "main" を既定にする。
+    cleaned = _BRANCH_SAFE_PATTERN.sub("-", value.strip()).strip("-/")
+    return cleaned or DEFAULT_BASE_BRANCH
 
 
 # --------------------------------------------------------------------------
@@ -380,11 +401,18 @@ def build_git_env(home_dir):
     - HOME: 専用 HOME(askpass helper と git 設定の置き場)。
     - GIT_ASKPASS: helper スクリプトの絶対パス。
     - GIT_TERMINAL_PROMPT=0: 端末での対話的資格情報入力を禁止(無人実行の保険)。
+    - GIT_AUTHOR_* / GIT_COMMITTER_*: commit author/committer を kiro-bot に固定。
+      プロンプトの `git config` 指示に加えて env でも確定させ、Kiro が config を
+      省いても個人を識別しない bot 表記で commit されるようにする。
     """
     return {
         "HOME": home_dir,
         "GIT_ASKPASS": os.path.join(home_dir, GIT_ASKPASS_FILENAME),
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_AUTHOR_NAME": GIT_AUTHOR_NAME,
+        "GIT_AUTHOR_EMAIL": GIT_AUTHOR_EMAIL,
+        "GIT_COMMITTER_NAME": GIT_AUTHOR_NAME,
+        "GIT_COMMITTER_EMAIL": GIT_AUTHOR_EMAIL,
     }
 
 
@@ -425,6 +453,10 @@ def build_repo_prompt(repo_url, base_branch, request_id, user_prompt):
     if repo_url is None:
         return user_prompt
     branch = f"kiro/{sanitize_branch_component(request_id)}"
+    # base_branch は resolve_base_branch で正規化済みの想定だが、直接呼ばれても
+    # 危険文字を補間しないよう、ここでも安全文字に正規化する(多重防御)。
+    base_branch = _BRANCH_SAFE_PATTERN.sub("-", str(base_branch)).strip("-/") \
+        or DEFAULT_BASE_BRANCH
     return (
         "あなたは Git リポジトリ上で作業する開発エージェントです。"
         "以下の手順を順番に実行してください。\n"
@@ -535,7 +567,8 @@ def _s3_put_file(bucket, key, path):
 
 
 def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
-                        base_branch=DEFAULT_BASE_BRANCH):
+                        base_branch=DEFAULT_BASE_BRANCH,
+                        repo_url_rejected=False):
     """Kiro CLI を同期実行し、stdout・成果物・status.json を S3 に put する。
 
     戻り値: (ok, status_dict)。ok は
@@ -550,6 +583,11 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
       - helper は try/finally で必ず撤去する。PAT 実値はマスク対象に追加する。
       - report.json / report.md は workdir 直下に出る想定で、既存の select_artifacts
         経由に加えて明示的にも put を試みる。
+
+    repo_url_rejected=True は「呼び出し元が repoUrl を指定したが不正形式で
+    resolve_repo_url が拒否した」ことを示す。このとき Kiro は実行せず fail-closed
+    で終える(ok=false、status に理由)。不正 repoUrl を黙って従来モードに縮退させ
+    「push された」と誤認させないため(repoUrl 未指定の従来モードは影響しない)。
     """
     started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -608,6 +646,16 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
     # マスク対象の実値リスト(KIRO_API_KEY に加え、GitHub フローでは PAT も載せる)。
     secret_values = [api_key]
 
+    # ①' repoUrl 指定ありで不正形式(resolve_repo_url が拒否)なら fail-closed。
+    # 黙って従来モードに縮退させると「clone/push した」と誤認しうるため、Kiro を
+    # 実行せず status に理由を残して ok=false で返す(repoUrl 未指定は影響しない)。
+    if repo_url_rejected:
+        log("repoUrl specified but rejected; aborting git flow (fail-closed)")
+        status, _ = finalize(
+            secret_values, None, False, [], [], ["repoUrl-rejected"]
+        )
+        return False, status
+
     # ② GitHub フロー時は PAT 用 Secret ARN と専用 HOME を用意する(実値は helper 経由)。
     github_token_arn = os.environ.get("GITHUB_TOKEN_SECRET_ARN", "").strip()
 
@@ -619,32 +667,52 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
     env = dict(os.environ)
     env["KIRO_API_KEY"] = api_key
 
-    # GitHub フロー: 認証 helper の設置とプロンプト合成。helper は finally で撤去する。
+    # GitHub フロー: PAT 取得と認証 helper の設置。設置失敗でも status.json を必ず
+    # put するため、credential 準備以降は try/finally の内側で行う。helper は成否に
+    # 関わらず finally で撤去する。
     git_home = None
     run_prompt = prompt
     if repo_url is not None:
+        if not github_token_arn:
+            # repoUrl 指定ありで Secret ARN 未設定は push 不能。黙って走らせず
+            # fail-closed にする(repoUrl 無しの従来モードには影響しない)。
+            log("GITHUB_TOKEN_SECRET_ARN is not set but repoUrl given; "
+                "aborting git flow (fail-closed)")
+            status, _ = finalize(
+                secret_values, None, False, [], [], ["github-token-arn-missing"]
+            )
+            return False, status
+        # マスク境界に PAT 実値を載せ、同時に取得可否を fail-closed 判定に使う。
+        # ここで取得できない(= push もできず PAT を制御できない)なら、git フローは
+        # 走らせず failedUploads に記録して ok=false で返す。実値を制御下に置けない
+        # まま Kiro を走らせない(非漏洩境界を担保できないため)。
+        pat, pat_err = _fetch_secret(github_token_arn)
+        if not pat:
+            log(f"github token fetch failed; aborting git flow: {pat_err}")
+            status, _ = finalize(
+                secret_values, None, False, [], [],
+                ["github-token-fetch"],
+            )
+            return False, status
+        secret_values.append(pat)
+
+    # GitHub フロー: 認証 helper の設置とプロンプト合成。設置に失敗しても status.json
+    # を必ず put して返す(準備失敗でホストが status を得られず待ち続ける事態を防ぐ)。
+    # 準備段階で helper を置いた後に失敗した場合もここで撤去する。
+    if repo_url is not None:
         git_home = os.path.join(workdir, ".kiro-git-home")
-        if github_token_arn:
-            # マスク境界に PAT 実値を載せ、同時に取得可否を fail-closed 判定に使う。
-            # ここで取得できない(= push もできず PAT を制御できない)なら、git フローは
-            # 走らせず failedUploads に記録して ok=false で返す。実値を制御下に置けない
-            # まま Kiro を走らせない(非漏洩境界を担保できないため)。
-            pat, pat_err = _fetch_secret(github_token_arn)
-            if not pat:
-                log(f"github token fetch failed; aborting git flow: {pat_err}")
-                status, _ = finalize(
-                    secret_values, None, False, [], [],
-                    ["github-token-fetch"],
-                )
-                return False, status
-            secret_values.append(pat)
+        try:
             setup_git_credentials(git_home, github_token_arn)
             env.update(build_git_env(git_home))
-        else:
-            # Secret ARN 未設定は従来どおり許容する(push は失敗しうるが、PAT 取得の
-            # fail-closed 対象ではない。repoUrl 無しの従来モードには影響しない)。
-            log("GITHUB_TOKEN_SECRET_ARN is not set; git push may fail")
-        run_prompt = build_repo_prompt(repo_url, base_branch, request_id, prompt)
+            run_prompt = build_repo_prompt(repo_url, base_branch, request_id, prompt)
+        except Exception as exc:  # noqa: BLE001
+            log("git credential setup failed; aborting git flow: "
+                f"{mask_secrets(str(exc), secret_values)}")
+            cleanup_git_credentials(git_home)
+            status, _ = finalize(
+                secret_values, None, False, [], [], ["git-credential-setup"]
+            )
+            return False, status
 
     exit_code = None
     timed_out = False
@@ -719,13 +787,23 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
             failed_uploads.append(name)
             log(f"artifact put failed: {name}: {mask_secrets(detail, secret_values)}")
 
-    # ⑥' GitHub フロー: report.json / report.md を明示的にも put する。
-    # 既存の select_artifacts 経由(workdir 直下)に加え、生成の有無を status に
-    # 反映するため個別に put を試みる(置き換えでなく追加)。既に artifacts に
-    # 入っていれば二重 put せず、未生成・put 失敗は failed_uploads に記録する。
+    # ⑥' GitHub フロー: report.json / report.md は必須成果物として put を保証する。
+    # 既存の select_artifacts 経由(workdir 直下)に加え、生成・put の有無を status に
+    # 反映する(置き換えでなく追加)。report は「S3 に無ければ失敗」とする必須扱いの
+    # ため、未生成・秘密検知での skip・put 失敗のいずれも failed_uploads に記録して
+    # ok=false にする。既に artifacts に入っていれば(select_artifacts 経由で put 済み)
+    # 二重 put しない。
     if repo_url is not None:
         for report_name in ("report.json", "report.md"):
-            if report_name in artifacts or report_name in skipped:
+            if report_name in artifacts:
+                # select_artifacts 経由で put 済み。成功扱い。
+                continue
+            if report_name in skipped:
+                # select_artifacts 側で秘密検知により skip 済み = S3 に無い。
+                # report は必須のため failed_uploads にも記録し ok=false にする。
+                failed_uploads.append(report_name)
+                log(f"report skipped (secret detected), required -> failed: "
+                    f"{report_name}")
                 continue
             report_path = os.path.join(workdir, report_name)
             if not os.path.isfile(report_path):
@@ -734,8 +812,12 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
                 log(f"report missing: {report_name}")
                 continue
             if contains_secret(report_path, secret_values):
+                # 秘密検知で put させない。report は必須のため failed_uploads にも
+                # 記録して ok=false にする(S3 に無いまま成功扱いにしない)。
                 skipped.append(report_name)
-                log(f"report skipped (secret detected): {report_name}")
+                failed_uploads.append(report_name)
+                log(f"report skipped (secret detected), required -> failed: "
+                    f"{report_name}")
                 continue
             put_ok, detail = _s3_put_file(bucket, f"{prefix}{report_name}", report_path)
             if put_ok:
@@ -786,6 +868,9 @@ class HookHandler(BaseHTTPRequestHandler):
             prefix = str(payload.get("prefix", "")).strip()
             prompt = resolve_prompt(payload)
             repo_url = resolve_repo_url(payload)
+            # repoUrl 指定ありで resolve_repo_url が拒否(不正形式)したら fail-closed。
+            # 「未指定で従来モード」と「指定ありだが不正」を区別して誤認を防ぐ。
+            repo_url_rejected = repo_url is None and repo_url_specified(payload)
             base_branch = resolve_base_branch(payload)
             # prefix 未指定なら microvmId でフォールバックし末尾スラッシュ正規化。
             if not prefix and microvm_id:
@@ -817,7 +902,8 @@ class HookHandler(BaseHTTPRequestHandler):
 
             def _background(prefix=prefix, request_id=request_id,
                             microvm_id=microvm_id, prompt=prompt,
-                            repo_url=repo_url, base_branch=base_branch):
+                            repo_url=repo_url, base_branch=base_branch,
+                            repo_url_rejected=repo_url_rejected):
                 # バックグラウンド実行の戻り(ok/status)で HTTP ステータスは決めない。
                 # 成否は run_kiro_and_upload が status.json に書く。例外は握りつぶさず
                 # ログに出す(キー値は env にしか無いが念のためパターンマスクを通す)。
@@ -825,6 +911,7 @@ class HookHandler(BaseHTTPRequestHandler):
                     run_kiro_and_upload(
                         prefix, request_id or microvm_id, prompt,
                         repo_url=repo_url, base_branch=base_branch,
+                        repo_url_rejected=repo_url_rejected,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log(f"run hook background -> ERROR {mask_secret(str(exc), None)}")

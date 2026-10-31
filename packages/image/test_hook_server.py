@@ -902,5 +902,328 @@ class TestGithubFlowPatValueSkip(unittest.TestCase):
         self.assertNotIn(pat, json.dumps(status, ensure_ascii=False))
 
 
+class TestReviewSecondRound(unittest.TestCase):
+    """レビュー差し戻し 2 周目(finding 1 blocking, 2/3/4/7/8)の回帰テスト。"""
+
+    # --- finding 2: baseBranch の安全文字正規化 ---
+
+    def test_base_branch_sanitized(self):
+        # 危険文字(スペース・`;`)を含む baseBranch は正規化される。
+        self.assertEqual(
+            hs.resolve_base_branch({"baseBranch": "feature/x"}), "feature/x"
+        )
+        self.assertNotIn(" ", hs.resolve_base_branch({"baseBranch": "a b"}))
+        self.assertNotIn(";", hs.resolve_base_branch({"baseBranch": "a;rm -rf"}))
+        # 記号のみ・空は既定 "main"。
+        self.assertEqual(hs.resolve_base_branch({"baseBranch": "@@@"}), "main")
+        self.assertEqual(hs.resolve_base_branch({}), "main")
+
+    def test_base_branch_used_in_prompt_is_safe(self):
+        p = hs.build_repo_prompt(
+            "https://github.com/a/b.git", "a;rm -rf", "req-1", "作業"
+        )
+        self.assertNotIn("a;rm -rf", p)
+
+    # --- finding 3: repoUrl 指定ありの区別 ---
+
+    def test_repo_url_specified_detects_presence(self):
+        # 不正形式でも「指定あり」は True(= fail-closed の対象)。
+        self.assertTrue(
+            hs.repo_url_specified({"repoUrl": "https://evil.example.com/a/b"})
+        )
+        self.assertTrue(
+            hs.repo_url_specified({"repoUrl": "https://github.com/a/b"})
+        )
+        # 未指定・空・非文字列は「指定なし」。
+        self.assertFalse(hs.repo_url_specified({}))
+        self.assertFalse(hs.repo_url_specified({"repoUrl": "  "}))
+        self.assertFalse(hs.repo_url_specified({"repoUrl": 123}))
+
+    # --- finding 4: commit author/committer を env で確定 ---
+
+    def test_build_git_env_fixes_commit_identity(self):
+        env = hs.build_git_env("/tmp/home-x")
+        self.assertEqual(env["GIT_AUTHOR_NAME"], hs.GIT_AUTHOR_NAME)
+        self.assertEqual(env["GIT_AUTHOR_EMAIL"], hs.GIT_AUTHOR_EMAIL)
+        self.assertEqual(env["GIT_COMMITTER_NAME"], hs.GIT_AUTHOR_NAME)
+        self.assertEqual(env["GIT_COMMITTER_EMAIL"], hs.GIT_AUTHOR_EMAIL)
+
+
+class TestReportRequired(unittest.TestCase):
+    """finding 1(blocking): report が S3 に無いときは必ず ok=false になる。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        self._req = os.path.basename(self._workdir.name)
+        self._pat = "ghp_realPatValue999"
+        patches = [
+            unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "RESULT_BUCKET": "bkt",
+                    "KIRO_API_KEY_SECRET_ARN": "arn:kiro",
+                    "GITHUB_TOKEN_SECRET_ARN": "arn:gh",
+                },
+                clear=False,
+            ),
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _fetch(self, arn):
+        if arn == "arn:gh":
+            return (self._pat, None)
+        return ("ksk_live", None)
+
+    def _run_writing(self, files):
+        """kiro-cli をモックし、呼ばれたら workdir に files を生成する。"""
+        def _run(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "kiro-cli":
+                wd = kwargs.get("cwd")
+                for name, content in files.items():
+                    mode = "wb" if isinstance(content, bytes) else "w"
+                    with open(os.path.join(wd, name), mode) as fh:
+                        fh.write(content)
+                proc = unittest.mock.Mock()
+                proc.returncode = 0
+                proc.stdout = b"done"
+                return proc
+            proc = unittest.mock.Mock()
+            proc.returncode = 0
+            proc.stdout = b""
+            return proc
+        return _run
+
+    def test_report_with_secret_skipped_is_failed_not_ok(self):
+        # report.json に実 PAT を混入 -> contains_secret で skip -> S3 に無い。
+        # report は必須のため failedUploads に記録し ok=false。
+        files = {
+            "report.json": json.dumps(
+                {
+                    "summary": f"leaked {self._pat}",
+                    "changes": [],
+                    "limitations": [],
+                    "branch": f"kiro/{self._req}",
+                    "pushedCommit": "abc",
+                }
+            ),
+            "report.md": "# 報告\n内容",
+        }
+        put_file = unittest.mock.Mock(return_value=(True, "s3://ok"))
+        with unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=self._run_writing(files)
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業",
+                repo_url="https://github.com/a/b.git",
+            )
+        # 秘密入り report は put されず(その key が cp 呼び出しに現れない)。
+        for call in put_file.call_args_list:
+            self.assertNotIn("report.json", call.args[1])
+        # report.json は skippedArtifacts かつ failedUploads に入る。
+        self.assertIn("report.json", status["skippedArtifacts"])
+        self.assertIn("report.json", status["failedUploads"])
+        # report が S3 に無いので ok=false。
+        self.assertFalse(ok)
+        self.assertFalse(status["ok"])
+        # PAT 実値はどこにも漏れない。
+        self.assertNotIn(self._pat, json.dumps(status, ensure_ascii=False))
+
+    def test_report_put_failure_is_failed_not_ok(self):
+        # report は生成されるが S3 put が失敗 -> failedUploads, ok=false。
+        files = {
+            "report.json": json.dumps(
+                {
+                    "summary": "s",
+                    "changes": [],
+                    "limitations": [],
+                    "branch": f"kiro/{self._req}",
+                    "pushedCommit": "abc",
+                }
+            ),
+            "report.md": "# 報告",
+        }
+        with unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=self._run_writing(files)
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(False, "aws s3 cp exited 1")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業",
+                repo_url="https://github.com/a/b.git",
+            )
+        self.assertIn("report.json", status["failedUploads"])
+        self.assertIn("report.md", status["failedUploads"])
+        self.assertFalse(ok)
+
+
+class TestRepoUrlRejectedFailClosed(unittest.TestCase):
+    """finding 3: repoUrl 指定ありで不正形式なら Kiro を実行せず ok=false。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        self._req = os.path.basename(self._workdir.name)
+        patches = [
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_rejected_repo_url_aborts_without_running_kiro(self):
+        kiro_run = unittest.mock.Mock()
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"RESULT_BUCKET": "bkt", "KIRO_API_KEY_SECRET_ARN": "arn:kiro"},
+            clear=False,
+        ), unittest.mock.patch.object(
+            hs, "_fetch_secret", return_value=("ksk_live", None)
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", kiro_run
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業",
+                repo_url=None,
+                repo_url_rejected=True,
+            )
+        self.assertFalse(kiro_run.called)
+        self.assertFalse(ok)
+        self.assertFalse(status["ok"])
+        self.assertIn("repoUrl-rejected", status["failedUploads"])
+
+
+class TestGithubArnMissingFailClosed(unittest.TestCase):
+    """finding 8: repoUrl 指定ありで GITHUB_TOKEN_SECRET_ARN 未設定なら ok=false。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        self._req = os.path.basename(self._workdir.name)
+        patches = [
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_arn_missing_with_repo_url_aborts(self):
+        kiro_run = unittest.mock.Mock()
+        # GITHUB_TOKEN_SECRET_ARN を明示的に空にする。
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "RESULT_BUCKET": "bkt",
+                "KIRO_API_KEY_SECRET_ARN": "arn:kiro",
+                "GITHUB_TOKEN_SECRET_ARN": "",
+            },
+            clear=False,
+        ), unittest.mock.patch.object(
+            hs, "_fetch_secret", return_value=("ksk_live", None)
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", kiro_run
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業",
+                repo_url="https://github.com/a/b.git",
+            )
+        self.assertFalse(kiro_run.called)
+        self.assertFalse(ok)
+        self.assertIn("github-token-arn-missing", status["failedUploads"])
+
+
+class TestSetupFailureStillWritesStatus(unittest.TestCase):
+    """finding 7: credential 準備が失敗しても status.json を必ず put する。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        self._req = os.path.basename(self._workdir.name)
+        patches = [
+            unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "RESULT_BUCKET": "bkt",
+                    "KIRO_API_KEY_SECRET_ARN": "arn:kiro",
+                    "GITHUB_TOKEN_SECRET_ARN": "arn:gh",
+                },
+                clear=False,
+            ),
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _fetch(self, arn):
+        if arn == "arn:gh":
+            return ("ghp_pat", None)
+        return ("ksk_live", None)
+
+    def test_status_put_attempted_when_setup_fails(self):
+        # credential 準備が例外を投げても、例外は呼び出し側へ伝播させず
+        # status.json を put して fail-closed で返す(ホストが status を得られる)。
+        put_bytes = unittest.mock.Mock(return_value=(True, "s3://status"))
+        with unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch
+        ), unittest.mock.patch.object(
+            hs, "setup_git_credentials", side_effect=OSError("disk full")
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run"
+        ) as kiro_run, unittest.mock.patch.object(
+            hs, "_s3_put_bytes", put_bytes
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業",
+                repo_url="https://github.com/a/b.git",
+            )
+        # 準備失敗でも status.json の put は試みられる。
+        self.assertTrue(put_bytes.called)
+        # kiro-cli は走らない(準備段階で失敗)。
+        self.assertFalse(kiro_run.called)
+        # fail-closed: ok=false、理由が failedUploads に残る。
+        self.assertFalse(ok)
+        self.assertIn("git-credential-setup", status["failedUploads"])
+
+
 if __name__ == "__main__":
     unittest.main()
