@@ -637,5 +637,270 @@ class TestRunKiroGithubFlow(unittest.TestCase):
         self.assertFalse(os.path.exists(helper))
 
 
+class TestReviewFindingRegressions(unittest.TestCase):
+    """レビュー差し戻し(finding 1/2/4/5)の回帰テスト。"""
+
+    # --- finding 2: github_pat_ (fine-grained PAT)のマスク ---
+
+    def test_mask_fine_grained_github_pat(self):
+        tok = "github_pat_11ABCDEF0_abcdefGHIJ1234567890"
+        masked = hs.mask_secret(f"token={tok} end", None)
+        self.assertNotIn(tok, masked)
+        self.assertIn("[REDACTED]", masked)
+
+    def test_contains_secret_detects_fine_grained_pat(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.txt")
+            with open(p, "w") as fh:
+                fh.write("remote github_pat_11ABCDEF0_xyz inside")
+            self.assertTrue(hs.contains_secret(p, None))
+
+    def test_name_contains_fine_grained_pat(self):
+        self.assertTrue(hs.name_contains_secret("github_pat_11ABC_x.txt", None))
+
+    # --- finding 1: skip 検査が PAT 実値(完全一致)を見る ---
+
+    def test_contains_secret_detects_pat_real_value(self):
+        # gh[pousr]_/github_pat_ 形式に当たらない PAT 実値でも、実値リストを
+        # 渡せば完全一致で検知し put を skip する。
+        pat = "tokenWithoutKnownPrefix123456"
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.txt")
+            with open(p, "w") as fh:
+                fh.write(f"leaked {pat} here")
+            self.assertTrue(hs.contains_secret(p, [pat]))
+            # 実値を渡さなければパターンにも当たらず検知しない。
+            self.assertFalse(hs.contains_secret(p, None))
+
+    def test_name_contains_secret_pat_real_value(self):
+        pat = "tokenWithoutKnownPrefix123456"
+        self.assertTrue(hs.name_contains_secret(f"out-{pat}.txt", [pat]))
+        self.assertFalse(hs.name_contains_secret(f"out-{pat}.txt", None))
+
+    def test_contains_secret_multiple_values(self):
+        # 複数実値(API キー + PAT)のいずれかに当たれば True。
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.txt")
+            with open(p, "w") as fh:
+                fh.write("only the second value appearsVALUE2 here")
+            self.assertTrue(
+                hs.contains_secret(p, ["VALUE1_absent", "appearsVALUE2"])
+            )
+
+    def test_name_contains_secret_backward_compat_single_key(self):
+        # 既存の単一 api_key(str/None)シグネチャが引き続き動く。
+        self.assertTrue(hs.name_contains_secret("ksk_live123.html", "ksk_live123"))
+        self.assertFalse(hs.name_contains_secret("weather.html", "ksk_live123"))
+
+    # --- finding 5: repoUrl 検証 / requestId のブランチ名正規化 ---
+
+    def test_repo_url_valid_github_https(self):
+        self.assertEqual(
+            hs.resolve_repo_url({"repoUrl": "https://github.com/a/b.git"}),
+            "https://github.com/a/b.git",
+        )
+
+    def test_repo_url_rejects_userinfo(self):
+        # user:pass@ を含む偽装 URL は拒否(None)。
+        self.assertIsNone(
+            hs.resolve_repo_url({"repoUrl": "https://ghp_x@github.com/a/b.git"})
+        )
+
+    def test_repo_url_rejects_other_host(self):
+        self.assertIsNone(
+            hs.resolve_repo_url({"repoUrl": "https://evil.example.com/a/b.git"})
+        )
+
+    def test_repo_url_rejects_non_https_scheme(self):
+        self.assertIsNone(
+            hs.resolve_repo_url({"repoUrl": "git@github.com:a/b.git"})
+        )
+        self.assertIsNone(
+            hs.resolve_repo_url({"repoUrl": "http://github.com/a/b.git"})
+        )
+
+    def test_is_valid_repo_url(self):
+        self.assertTrue(hs.is_valid_repo_url("https://github.com/a/b"))
+        self.assertFalse(hs.is_valid_repo_url("https://x@github.com/a/b"))
+        self.assertFalse(hs.is_valid_repo_url(None))
+
+    def test_sanitize_branch_component(self):
+        # 危険文字を除去し kiro/<component> に安全に埋め込める。
+        self.assertEqual(
+            hs.sanitize_branch_component("req-2024/01/01-123"),
+            "req-2024/01/01-123",
+        )
+        self.assertNotIn(" ", hs.sanitize_branch_component("a b c"))
+        self.assertNotIn(";", hs.sanitize_branch_component("a;rm -rf"))
+        # 空・記号のみは "run" にフォールバック。
+        self.assertEqual(hs.sanitize_branch_component("  "), "run")
+        self.assertEqual(hs.sanitize_branch_component("@@@"), "run")
+
+    def test_build_repo_prompt_uses_sanitized_branch(self):
+        p = hs.build_repo_prompt(
+            "https://github.com/a/b.git", "main", "req 1;evil", "作業"
+        )
+        # 危険文字はブランチ名に出ない。
+        self.assertIn("kiro/req-1-evil", p)
+        self.assertNotIn("kiro/req 1;evil", p)
+
+
+class TestGithubTokenFetchFailClosed(unittest.TestCase):
+    """finding 4: GITHUB_TOKEN_SECRET_ARN 設定時に PAT 取得失敗なら git フロー非実行。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        self._req = os.path.basename(self._workdir.name)
+        patches = [
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_pat_fetch_failure_aborts_git_flow(self):
+        def _fetch(arn):
+            if arn == "arn:gh":
+                return (None, "secret fetch exited 1")
+            return ("ksk_live", None)
+
+        kiro_run = unittest.mock.Mock()
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "RESULT_BUCKET": "bkt",
+                "KIRO_API_KEY_SECRET_ARN": "arn:kiro",
+                "GITHUB_TOKEN_SECRET_ARN": "arn:gh",
+            },
+            clear=False,
+        ), unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=_fetch
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", kiro_run
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業",
+                repo_url="https://github.com/a/b.git",
+            )
+        # git フローは走らない(kiro-cli を起動しない)。
+        self.assertFalse(kiro_run.called)
+        self.assertFalse(ok)
+        self.assertFalse(status["ok"])
+        self.assertIn("github-token-fetch", status["failedUploads"])
+        # helper も設置されない。
+        helper = os.path.join(
+            self._workdir.name, ".kiro-git-home", hs.GIT_ASKPASS_FILENAME
+        )
+        self.assertFalse(os.path.exists(helper))
+
+    def test_legacy_mode_unaffected_by_github_arn_absence(self):
+        # repoUrl 無し(従来モード)は GITHUB_TOKEN_SECRET_ARN と無関係に実行する。
+        with open(os.path.join(self._workdir.name, "weather.html"), "w") as fh:
+            fh.write("<html>ok</html>")
+        proc = unittest.mock.Mock()
+        proc.returncode = 0
+        proc.stdout = b"done"
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"RESULT_BUCKET": "bkt", "KIRO_API_KEY_SECRET_ARN": "arn:kiro"},
+            clear=False,
+        ), unittest.mock.patch.object(
+            hs, "_fetch_secret", return_value=("ksk_live", None)
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", return_value=proc
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/", self._req, "p"
+            )
+        self.assertTrue(ok)
+        self.assertIn("weather.html", status["artifacts"])
+
+
+class TestGithubFlowPatValueSkip(unittest.TestCase):
+    """finding 1 回帰: gh 形式でない PAT 実値が成果物に混入したら skip される。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        self._req = os.path.basename(self._workdir.name)
+        # 既知プレフィックスに当たらない PAT 実値。
+        self._pat = "opaquePatNoKnownPrefix01234567"
+        patches = [
+            unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "RESULT_BUCKET": "bkt",
+                    "KIRO_API_KEY_SECRET_ARN": "arn:kiro",
+                    "GITHUB_TOKEN_SECRET_ARN": "arn:gh",
+                },
+                clear=False,
+            ),
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _fetch(self, arn):
+        if arn == "arn:gh":
+            return (self._pat, None)
+        return ("ksk_live", None)
+
+    def test_pat_value_in_artifact_skipped_and_not_leaked(self):
+        pat = self._pat
+
+        def _run(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "kiro-cli":
+                wd = kwargs.get("cwd")
+                # Kiro が誤って PAT 実値を成果物に書いてしまったケース。
+                with open(os.path.join(wd, "leak.txt"), "w") as fh:
+                    fh.write(f"accidentally wrote {pat} to a file")
+                proc = unittest.mock.Mock()
+                proc.returncode = 0
+                proc.stdout = b"done"
+                return proc
+            proc = unittest.mock.Mock()
+            proc.returncode = 0
+            proc.stdout = b""
+            return proc
+
+        put_file = unittest.mock.Mock(return_value=(True, "s3://ok"))
+        with unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=_run
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業",
+                repo_url="https://github.com/a/b.git",
+            )
+        # PAT 実値を含む成果物は put されず skip される。
+        self.assertIn("leak.txt", status["skippedArtifacts"])
+        self.assertNotIn("leak.txt", status["artifacts"])
+        # put した key・status のどこにも PAT 実値が出ない。
+        for call in put_file.call_args_list:
+            self.assertNotIn(pat, call.args[1])
+        self.assertNotIn(pat, json.dumps(status, ensure_ascii=False))
+
+
 if __name__ == "__main__":
     unittest.main()

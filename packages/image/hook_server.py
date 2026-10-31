@@ -67,9 +67,10 @@ _KSK_PATTERN = re.compile(r"ksk_\S+")
 # contains_secret のバイト列検査でキー形式を拾う保険パターン(空白以外を貪欲に)。
 _KSK_PATTERN_BYTES = re.compile(rb"ksk_\S+")
 
-# GitHub トークンの保険パターン(新形式: ghp_/gho_/ghu_/ghs_/ghr_ など)。
-_GH_TOKEN_PATTERN = re.compile(r"gh[pousr]_\S+")
-_GH_TOKEN_PATTERN_BYTES = re.compile(rb"gh[pousr]_\S+")
+# GitHub トークンの保険パターン(新形式: ghp_/gho_/ghu_/ghs_/ghr_ と fine-grained
+# PAT の github_pat_ を含む)。
+_GH_TOKEN_PATTERN = re.compile(r"(gh[pousr]|github_pat)_\S+")
+_GH_TOKEN_PATTERN_BYTES = re.compile(rb"(gh[pousr]|github_pat)_\S+")
 
 # GitHub トークンの旧形式(40 桁 hex)。単語境界で囲み通常の hex 文字列を巻き込みにくくする。
 _GH_HEX_PATTERN = re.compile(r"\b[0-9a-f]{40}\b")
@@ -149,33 +150,55 @@ def select_artifacts(workdir):
     return result
 
 
-def name_contains_secret(name, api_key):
-    """ファイル名に実キー値(非空時)または明確なトークン形式が含まれれば True。
+def _as_secret_values(secret_values):
+    """後方互換: 単一の api_key(str/None)でも実値リストでも受けられるよう正規化する。
+
+    既存呼び出し(api_key 1 本)を壊さず、PAT を含む複数実値のリストも受けられる。
+    戻りは非空文字列のタプル。
+    """
+    if secret_values is None:
+        return ()
+    if isinstance(secret_values, (str, bytes, bytearray)):
+        secret_values = [secret_values]
+    result = []
+    for value in secret_values:
+        if value:
+            result.append(value)
+    return tuple(result)
+
+
+def name_contains_secret(name, secret_values):
+    """ファイル名に実値(非空時)または明確なトークン形式が含まれれば True。
 
     --trust-all-tools の Kiro はファイル名に API キー / PAT を埋め込みうる。名前は
     S3 key・status.json・ログ・/run 応答へ伝播するため、内容と同じ検査を
     名前にも適用する(非漏洩境界をファイル名が迂回しないように)。検査対象は
-    実キー値の完全一致と ksk_ / gh[pousr]_ 形式。40 桁 hex は git SHA と衝突する
-    ため skip 判定には使わない(マスク側のみで扱う)。
+    実値(KIRO_API_KEY・PAT)の完全一致と ksk_ / (gh[pousr]|github_pat)_ 形式。
+    40 桁 hex は git SHA と衝突するため skip 判定には使わない(マスク側のみで扱う)。
+    secret_values は単一の api_key(str/None)でも実値リストでも受ける(後方互換)。
     """
     if not isinstance(name, str):
         name = str(name)
-    if api_key and api_key in name:
-        return True
+    for value in _as_secret_values(secret_values):
+        text_value = value if isinstance(value, str) else value.decode("utf-8", "replace")
+        if text_value and text_value in name:
+            return True
     for pattern in _SKIP_PATTERNS:
         if pattern.search(name):
             return True
     return False
 
 
-def contains_secret(path, api_key):
-    """ファイル内容に実キー値(非空時)または明確なトークン形式が含まれれば True。
+def contains_secret(path, secret_values):
+    """ファイル内容に実値(非空時)または明確なトークン形式が含まれれば True。
 
-    FR-5 を満たすため fail-closed。バイト列として読み、実キーの UTF-8 バイト列と
-    ksk_ / gh[pousr]_ のバイトパターンを検査する(エンコーディング・不正バイトに
-    依存しない)。40 桁 hex は git SHA と衝突するため skip 判定には使わない。
-    読取不能(OSError 等)は検査不能として安全側に倒し True を返す(put させず
-    skippedArtifacts に回す)。デコード失敗を「漏洩なし」にしない。
+    FR-5 を満たすため fail-closed。バイト列として読み、各実値(KIRO_API_KEY・PAT)の
+    UTF-8 バイト列と ksk_ / (gh[pousr]|github_pat)_ のバイトパターンを検査する
+    (エンコーディング・不正バイトに依存しない)。40 桁 hex は git SHA と衝突する
+    ため skip 判定には使わない。読取不能(OSError 等)は検査不能として安全側に倒し
+    True を返す(put させず skippedArtifacts に回す)。デコード失敗を「漏洩なし」に
+    しない。secret_values は単一の api_key(str/None)でも実値リストでも受ける
+    (後方互換)。
     """
     try:
         with open(path, "rb") as fh:
@@ -183,9 +206,12 @@ def contains_secret(path, api_key):
     except OSError:
         # 検査できない = 安全を保証できない。put させない(fail-closed)。
         return True
-    if api_key:
-        key_bytes = api_key.encode("utf-8", "surrogatepass") if isinstance(api_key, str) else bytes(api_key)
-        if key_bytes and key_bytes in data:
+    for value in _as_secret_values(secret_values):
+        if isinstance(value, (bytes, bytearray)):
+            value_bytes = bytes(value)
+        else:
+            value_bytes = value.encode("utf-8", "surrogatepass")
+        if value_bytes and value_bytes in data:
             return True
     for pattern in _SKIP_PATTERNS_BYTES:
         if pattern.search(data):
@@ -270,12 +296,46 @@ def resolve_prompt(payload):
     return DEFAULT_PROMPT
 
 
+# repoUrl として許可する形式: https://github.com/ 直下のパスのみ。userinfo
+# (`user:pass@`)や別ホストへの差し替えを拒否し、clone 先を github.com に固定する。
+# 認証はトークン非埋め込み(GIT_ASKPASS 経由)が前提のため、URL に `@` を許さない。
+_REPO_URL_PATTERN = re.compile(r"^https://github\.com/[^@\s]+$")
+
+# ブランチ名に使える安全な文字(requestId の正規化に使う)。英数と `-_./` のみ。
+_BRANCH_SAFE_PATTERN = re.compile(r"[^A-Za-z0-9._/-]")
+
+
+def is_valid_repo_url(value):
+    """repoUrl が許可形式(https://github.com/ 直下・userinfo なし)か判定する。"""
+    return bool(isinstance(value, str) and _REPO_URL_PATTERN.match(value))
+
+
 def resolve_repo_url(payload):
-    """payload["repoUrl"] を取り出す。未指定/空/非文字列なら None(= clone なし)。"""
+    """payload["repoUrl"] を取り出す。未指定/空/非文字列/不正形式なら None(= clone なし)。
+
+    許可形式は https://github.com/ 直下のパスのみ。`@`(userinfo)を含む URL や
+    別ホスト・別スキームは拒否し、clone 先を固定して資格情報混入 URL を弾く。
+    """
     value = payload.get("repoUrl") if isinstance(payload, dict) else None
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
+    if not (isinstance(value, str) and value.strip()):
+        return None
+    candidate = value.strip()
+    if not is_valid_repo_url(candidate):
+        log("repoUrl rejected: not an https://github.com/ URL without userinfo")
+        return None
+    return candidate
+
+
+def sanitize_branch_component(value):
+    """ブランチ名に埋め込む文字列(requestId)を安全な文字だけに正規化する。
+
+    英数と `-_./` 以外を `-` に置換する。空になるときは "run" にフォールバック。
+    `git checkout -b kiro/<component>` のインジェクション・不正ブランチ名を防ぐ。
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    cleaned = _BRANCH_SAFE_PATTERN.sub("-", value).strip("-/")
+    return cleaned or "run"
 
 
 def resolve_base_branch(payload):
@@ -364,7 +424,7 @@ def build_repo_prompt(repo_url, base_branch, request_id, user_prompt):
     """
     if repo_url is None:
         return user_prompt
-    branch = f"kiro/{request_id}"
+    branch = f"kiro/{sanitize_branch_component(request_id)}"
     return (
         "あなたは Git リポジトリ上で作業する開発エージェントです。"
         "以下の手順を順番に実行してください。\n"
@@ -565,16 +625,24 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
     if repo_url is not None:
         git_home = os.path.join(workdir, ".kiro-git-home")
         if github_token_arn:
+            # マスク境界に PAT 実値を載せ、同時に取得可否を fail-closed 判定に使う。
+            # ここで取得できない(= push もできず PAT を制御できない)なら、git フローは
+            # 走らせず failedUploads に記録して ok=false で返す。実値を制御下に置けない
+            # まま Kiro を走らせない(非漏洩境界を担保できないため)。
+            pat, pat_err = _fetch_secret(github_token_arn)
+            if not pat:
+                log(f"github token fetch failed; aborting git flow: {pat_err}")
+                status, _ = finalize(
+                    secret_values, None, False, [], [],
+                    ["github-token-fetch"],
+                )
+                return False, status
+            secret_values.append(pat)
             setup_git_credentials(git_home, github_token_arn)
             env.update(build_git_env(git_home))
-            # PAT 実値をマスク対象に載せる(実際の受け渡しは helper 経由で、
-            # ここでは漏洩検査・マスク境界に値を含めるためだけに取得する)。
-            pat, pat_err = _fetch_secret(github_token_arn)
-            if pat:
-                secret_values.append(pat)
-            else:
-                log(f"github token fetch for mask failed: {pat_err}")
         else:
+            # Secret ARN 未設定は従来どおり許容する(push は失敗しうるが、PAT 取得の
+            # fail-closed 対象ではない。repoUrl 無しの従来モードには影響しない)。
             log("GITHUB_TOKEN_SECRET_ARN is not set; git push may fail")
         run_prompt = build_repo_prompt(repo_url, base_branch, request_id, prompt)
 
@@ -633,13 +701,13 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
         full = os.path.join(workdir, name)
         # 名前にキーが埋め込まれている場合、元名は S3 key・status・ログ・応答の
         # どこにも出さない。put もせず、固定の安全表記で skipped に記録する。
-        if name_contains_secret(name, api_key):
+        if name_contains_secret(name, secret_values):
             redacted_name_count += 1
             safe_name = f"<redacted-filename-{redacted_name_count}>"
             skipped.append(safe_name)
             log(f"artifact skipped (secret in filename): {safe_name}")
             continue
-        if contains_secret(full, api_key):
+        if contains_secret(full, secret_values):
             skipped.append(name)
             log(f"artifact skipped (secret detected): {name}")
             continue
@@ -665,7 +733,7 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
                 failed_uploads.append(report_name)
                 log(f"report missing: {report_name}")
                 continue
-            if contains_secret(report_path, api_key):
+            if contains_secret(report_path, secret_values):
                 skipped.append(report_name)
                 log(f"report skipped (secret detected): {report_name}")
                 continue
