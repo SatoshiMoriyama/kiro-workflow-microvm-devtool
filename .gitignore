@@ -9,3 +9,4 @@ packages/infra/artifact-hash.txt
 __pycache__/
 *.pyc
 blog/
+.agents/
