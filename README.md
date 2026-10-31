@@ -19,6 +19,7 @@ GitHub リポジトリを clone してブランチを切り、Kiro が作業し�
 │  └─ image/                    # MicroVM イメージの中身(code artifact)
 │     ├─ Dockerfile             # al2023-minimal + awscli + kiro-cli(musl) + Python フックサーバ
 │     ├─ hook_server.py         # /ready に 200、/run で Kiro CLI 実行 -> 成果物+status.json を S3 に put
+│     ├─ steering/              # MicroVM 内 kiro-cli 用グローバル steering(手元 Kiro IDE には無関係)
 │     └─ test_hook_server.py    # hook_server の純関数ユニットテスト
 ├─ scripts/
 │  ├─ deploy.sh                 # Base -> zip 投入 -> Image を 1 コマンドで(pnpm deploy)
@@ -48,6 +49,7 @@ GitHub リポジトリを clone してブランチを切り、Kiro が作業し�
 - **方式A の限界（PAT の原理的な取得可能性）**: 方式A は「PAT をプロンプト・URL・出力に出さない」ことを保証するが、PAT を物理的に遮断するものではない。`--trust-all-tools` のゲストは `GIT_ASKPASS` helper や `aws secretsmanager get-secret-value` を自分で実行すれば PAT を原理的に取得できる。そのため本方式の守りは PAT の秘匿そのものではなく、executionRole の最小権限（当該 Secret の read と result バケット put のみ）と egress 制御（INTERNET_EGRESS）に依存する。
 - **git 設定のスコープ（実機疎通時に確認）**: 方式A では Kiro の子プロセスに `HOME` を専用ディレクトリへ差し替えて `GIT_ASKPASS` helper を仕込む。`HOME` 差し替えは kiro-cli / aws CLI など git 以外のツールの設定探索にも及びうるため、実機 `run-microvm` での初回疎通時に、Kiro 本体や aws CLI の挙動に影響が出ていないかを確認する。影響が出る場合は `HOME` ごと差し替える代わりに `GIT_CONFIG_GLOBAL` 等で git に限定する方式へ切り替える。
 - **作業報告の出力**: GitHub フローでは Kiro が `report.json`（機械可読: `summary`・`changes`・`limitations`・`branch`・`pushedCommit`）と `report.md`（PR 本文に貼れる形: 何をしたか／変更点／制限事項）を生成する。既存の成果物 put 経路に加え、hook_server が同 prefix に明示的にも put を試みる（生成失敗・put 失敗は `status.json` の `failedUploads` に残る）。
+- **グローバル steering の焼き込み（MicroVM 内 kiro-cli のみ）**: 全 run 共通の注意事項を `packages/image/steering/*.md` に置き、Dockerfile で `/root/.kiro/steering/` へ `COPY` してイメージに焼き込む。Dockerfile で `ENV KIRO_HOME=/root/.kiro` を固定するため、GitHub フローで Kiro の `HOME` を per-run に差し替えても steering の読み込み先（`KIRO_HOME/steering`）は一定で、天気タスク・GitHub フロー双方に効く（グローバル steering の読み込みパスが CLI で有効なことは公式の capability matrix で確認）。フォールバックとして GitHub フローでは、hook_server のプロンプトに「clone 後、リポジトリ直下に `.kiro/steering/<name>.md` が無ければ `/root/.kiro/steering/<name>.md` をコピーして配置し、その内容を遵守する」手順を差し込む（主経路＝グローバル／フォールバック＝ワークスペースの二層）。このフォールバックで置く steering は対象リポジトリの履歴を汚さないよう `git add` から除外し commit/push に含めない。本文は `packages/image/steering/` に `.md` を足して更新し、**更新には再デプロイが必要**（`package-image.sh` が内容ハッシュを更新 → CFN 再ビルド）。S3/payload からの動的供給はしない。**この steering は MicroVM 内の headless kiro-cli にだけ効き、開発者の手元の Kiro IDE やリポジトリ直下の `.kiro/steering/` には一切関与しない。**
 - **`--trust-all-tools` の安全柵**: 人のいないゲストで承認待ちを出さないため全許可にする。承認は安全柵にならないので、代わりに executionRole の最小権限(result バケットへの put と当該 Secret の read のみ)と egress 制御(INTERNET_EGRESS)が安全柵を担う。
 - **時間制約の階層(非同期)**: 2 つの時間制約は別物。
   - `/run` の `RunTimeoutInSeconds`=60(`image-stack.ts`): `/run` が 200 を返すまでの上限(サービスモデル max=60)。即 200 を返すので 60 で十分。

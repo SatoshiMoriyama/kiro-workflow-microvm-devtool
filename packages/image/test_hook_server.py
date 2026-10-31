@@ -1225,5 +1225,85 @@ class TestSetupFailureStillWritesStatus(unittest.TestCase):
         self.assertIn("git-credential-setup", status["failedUploads"])
 
 
+class TestGlobalSteering(unittest.TestCase):
+    def test_read_md_only_sorted(self):
+        # .md のみを名前昇順で (name, text) で返す。非 md・サブディレクトリは除外。
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "10-x.md"), "w", encoding="utf-8") as fh:
+                fh.write("second")
+            with open(os.path.join(d, "00-global.md"), "w", encoding="utf-8") as fh:
+                fh.write("first")
+            open(os.path.join(d, "notes.txt"), "w").close()
+            os.mkdir(os.path.join(d, "sub.md"))  # .md 拡張子だがディレクトリ
+            result = hs.read_global_steering_files(d)
+            self.assertEqual(
+                result, [("00-global.md", "first"), ("10-x.md", "second")]
+            )
+
+    def test_read_missing_dir_returns_empty(self):
+        self.assertEqual(hs.read_global_steering_files("/no/such/steering"), [])
+
+    def test_fallback_instructions_empty_for_no_files(self):
+        self.assertEqual(hs.build_steering_fallback_instructions([]), "")
+        self.assertEqual(hs.build_steering_fallback_instructions(None), "")
+
+    def test_fallback_instructions_contains_required_elements(self):
+        text = hs.build_steering_fallback_instructions(
+            [("00-global.md", "本文")]
+        )
+        self.assertIn(".kiro/steering/", text)
+        self.assertIn("00-global.md", text)
+        self.assertIn(hs.GLOBAL_STEERING_DIR, text)
+        self.assertIn("git add", text)
+        self.assertIn("commit/push に含めない", text)
+
+    def test_none_repo_passthrough_unchanged_with_steering(self):
+        # steering が焼かれていても repoUrl=None は user_prompt を素通し。
+        with unittest.mock.patch.object(
+            hs, "read_global_steering_files",
+            return_value=[("00-global.md", "本文")],
+        ):
+            self.assertEqual(
+                hs.build_repo_prompt(None, "main", "req-1", "do work"), "do work"
+            )
+
+    def test_repo_prompt_injects_steering_before_work(self):
+        # repoUrl 指定時、clone 後・作業前に steering 配置手順と add 除外文言が入り、
+        # 既存の必須要素も保持される。
+        with unittest.mock.patch.object(
+            hs, "read_global_steering_files",
+            return_value=[("00-global.md", "本文")],
+        ):
+            p = hs.build_repo_prompt(
+                "https://github.com/a/b.git", "main", "req-9", "作業内容"
+            )
+        self.assertIn(".kiro/steering/00-global.md", p)
+        self.assertIn("git add", p)
+        self.assertIn("commit/push に含めない", p)
+        # clone(手順1)の後、config(手順2)の前に差し込まれる。
+        self.assertLess(p.index("git clone"), p.index(".kiro/steering/00-global.md"))
+        self.assertLess(
+            p.index(".kiro/steering/00-global.md"),
+            p.index(f'git config user.name "{hs.GIT_AUTHOR_NAME}"'),
+        )
+        # 既存の必須要素は保持。
+        self.assertIn("kiro/req-9", p)
+        self.assertIn("git push", p)
+        self.assertIn("report.json", p)
+        self.assertIn("report.md", p)
+
+    def test_repo_prompt_no_steering_matches_legacy(self):
+        # steering が無いときは差し込みが空で、従来の必須要素だけ含む。
+        with unittest.mock.patch.object(
+            hs, "read_global_steering_files", return_value=[]
+        ):
+            p = hs.build_repo_prompt(
+                "https://github.com/a/b.git", "main", "req-9", "作業内容"
+            )
+        self.assertNotIn(".kiro/steering/", p)
+        self.assertIn("kiro/req-9", p)
+        self.assertIn("report.json", p)
+
+
 if __name__ == "__main__":
     unittest.main()

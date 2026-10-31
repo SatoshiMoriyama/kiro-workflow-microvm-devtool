@@ -61,6 +61,14 @@ except ValueError:
 # 成果物として put しない予約名。
 RESERVED_NAMES = {"kiro-stdout.txt", "status.json"}
 
+# MicroVM 内 kiro-cli 向けグローバル steering の焼き込み先(= KIRO_HOME/steering)。
+# Dockerfile で packages/image/steering/*.md をここへ COPY し、ENV KIRO_HOME=/root/.kiro
+# 固定で天気タスク・GitHub フロー双方の kiro-cli に常時適用させる。
+GLOBAL_STEERING_DIR = "/root/.kiro/steering"
+
+# GitHub フローのフォールバックで clone 先リポジトリ直下に置く steering の相対パス。
+GLOBAL_STEERING_WORKSPACE_SUBDIR = ".kiro/steering"
+
 # キー形式の保険パターン(第2段マスク)。
 _KSK_PATTERN = re.compile(r"ksk_\S+")
 
@@ -442,6 +450,59 @@ def cleanup_git_credentials(home_dir):
         pass
 
 
+def read_global_steering_files(steering_dir=GLOBAL_STEERING_DIR):
+    """steering_dir 直下(非再帰)の *.md を名前昇順で読み、[(filename, text), ...] を返す。
+
+    ディレクトリ不在・読取不能・個別ファイルの読取失敗は、そのファイルを飛ばして
+    処理を続ける(フォールバックが無くても既存挙動を壊さない)。戻りは basename と
+    その内容(str)のタプルのリスト。
+    """
+    result = []
+    try:
+        names = os.listdir(steering_dir)
+    except OSError:
+        return result
+    for name in sorted(names):
+        if not name.endswith(".md"):
+            continue
+        full = os.path.join(steering_dir, name)
+        if not os.path.isfile(full):
+            continue
+        try:
+            with open(full, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        result.append((name, text))
+    return result
+
+
+def build_steering_fallback_instructions(steering_files):
+    """GitHub フロー用プロンプトに差し込む steering 配置手順を返す。
+
+    clone 後、リポジトリ直下の .kiro/steering/<name>.md が無ければ、イメージ同梱の
+    /root/.kiro/steering/<name>.md をコピーして配置し、その内容を遵守させる。これらの
+    steering ファイルは対象リポジトリの履歴を汚さないよう commit/push に含めない
+    (git add 対象から除外する)。steering_files が空なら空文字列を返す(従来プロンプト
+    と同一の文面を保つ)。
+    """
+    files = list(steering_files or ())
+    if not files:
+        return ""
+    lines = []
+    for name, _text in files:
+        src = os.path.join(GLOBAL_STEERING_DIR, name)
+        dst = os.path.join(GLOBAL_STEERING_WORKSPACE_SUBDIR, name)
+        lines.append(f"     - `{dst}` が無ければ `{src}` をコピーして配置する。")
+    placements = "\n".join(lines)
+    return (
+        "   clone したリポジトリ直下に共通注意事項の steering を配置し、その内容を遵守する:\n"
+        f"{placements}\n"
+        f"     これら `{GLOBAL_STEERING_WORKSPACE_SUBDIR}/` の steering ファイルは "
+        "`git add` の対象から除外し、commit/push に含めない。\n"
+    )
+
+
 def build_repo_prompt(repo_url, base_branch, request_id, user_prompt):
     """Kiro に渡す実行プロンプトを組み立てる。
 
@@ -457,6 +518,9 @@ def build_repo_prompt(repo_url, base_branch, request_id, user_prompt):
     # 危険文字を補間しないよう、ここでも安全文字に正規化する(多重防御)。
     base_branch = _BRANCH_SAFE_PATTERN.sub("-", str(base_branch)).strip("-/") \
         or DEFAULT_BASE_BRANCH
+    # clone 後・作業前に、イメージ同梱のグローバル steering を clone 先へ配置する手順。
+    # steering が無ければ空文字列になり、従来のプロンプト文面と一致する。
+    steering_step = build_steering_fallback_instructions(read_global_steering_files())
     return (
         "あなたは Git リポジトリ上で作業する開発エージェントです。"
         "以下の手順を順番に実行してください。\n"
@@ -471,6 +535,7 @@ def build_repo_prompt(repo_url, base_branch, request_id, user_prompt):
         "## 手順\n"
         f"1. カレントディレクトリに `git clone {repo_url}` でリポジトリを clone し、"
         "clone したディレクトリに移動する。\n"
+        f"{steering_step}"
         f"2. `git config user.name \"{GIT_AUTHOR_NAME}\"` と "
         f"`git config user.email \"{GIT_AUTHOR_EMAIL}\"` を設定する(commit author を固定する)。\n"
         f"3. `git checkout {base_branch}` の後、`git checkout -b {branch}` で作業ブランチを作成する。\n"

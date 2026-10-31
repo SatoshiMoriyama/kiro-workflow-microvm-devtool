@@ -29,6 +29,14 @@ RUN curl -fsSL "$KIRO_CLI_DL_URL" -o /tmp/kirocli.zip \
 WORKDIR /app
 COPY hook_server.py /app/hook_server.py
 
+# MicroVM 内 kiro-cli 向けグローバル steering を焼き込む。
+# KIRO_HOME を固定することで、GitHub フローで HOME を per-run に差し替えても
+# グローバル設定ルート(= steering の読み込み先)が /root/.kiro で一定になる。
+# steering/ 配下の *.md を /root/.kiro/steering/ に COPY する(全 run に常時適用)。
+# 更新は packages/image/steering/ に .md を足す -> 再デプロイ(内容ハッシュ更新で CFN 再ビルド)。
+ENV KIRO_HOME=/root/.kiro
+COPY steering/ /root/.kiro/steering/
+
 # ライフサイクルフックを受ける HTTP サーバを常駐させる。
 # /ready に 200 を返すとビルド時にスナップショットが取られ、
 # run-microvm 後に /run が叩かれて Kiro CLI を実行し成果物を S3 に put する。
