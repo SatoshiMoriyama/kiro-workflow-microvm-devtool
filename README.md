@@ -4,6 +4,8 @@ Lambda MicroVMs 上で Kiro を動かすための開発ツール。pnpm モノ�
 
 MicroVM の中で Kiro CLI を headless 実行し、指示タスク（例: 札幌の天気を調べて HTML を作る）の成果物を S3 に格納する。
 
+GitHub リポジトリを clone してブランチを切り、Kiro が作業して commit・push し、作業報告（`report.json` / `report.md`）まで出すフローにも対応する（`repoUrl` を動的に指示する）。
+
 ## 構成
 
 ```
@@ -41,6 +43,9 @@ MicroVM の中で Kiro CLI を headless 実行し、指示タスク（例: 札�
 - **実行モデル(非同期)**: Dockerfile の CMD でフックサーバを常駐 → `/ready` に 200 でスナップショット → `run-microvm` で復帰 → `/run` フックは Kiro CLI 実行+S3 put 一式をバックグラウンドスレッドで起動し即 200(`{"status":"accepted"}`)を返す。`/run` の `RunTimeoutInSeconds` は上限 60 秒のため Kiro をここで同期実行できない。Kiro は MicroVM が生きている限り裏で走り、完了時に生成ファイル・`kiro-stdout.txt`・`status.json` を S3 prefix 配下へ put する。ホスト(`run.sh`)は `status.json` の出現をポーリングして完了を検知する(成否は `status.json` の `ok`/`exitCode`/`timedOut`/`failedUploads` で判定)。`RESULT_BUCKET` 未設定などバックグラウンド起動前に判明する前提エラーのみ `/run` を 500 にする。
 - **Kiro CLI(musl 版)**: Dockerfile は `kirocli-aarch64-linux-musl.zip` を導入する。AL2023 の glibc は 2.34 で gnu ビルドの要求 2.39 に満たないため(install.sh の glibc 検査で弾かれる)、静的リンクの musl ビルドを使う。認証は焼かない(`Q_SKIP_SETUP=1`)。
 - **KIRO_API_KEY の渡し方**: 実キーは IaC/イメージに焼かない。`image-stack.ts` が env `KIRO_API_KEY_SECRET_ARN`(Secret `kiro-microvm/kiro-api-key` の ARN のみ)を注入し、`/run` 実行時に executionRole の短命 credential でゲストが `aws secretsmanager get-secret-value` して取得する。値は CloudWatch Logs・S3 成果物・`status.json`・ホスト stdout のいずれにも出さない(二段マスク: 実キー値の完全一致置換 + `ksk_\S+` パターン置換)。
+- **GitHub フロー（clone→ブランチ→作業→commit→push→作業報告）**: `repoUrl` を指定した run では、hook_server が Kiro へのプロンプトに前後処理を組み込み、clone・`git config`（author 固定）・ブランチ `kiro/<requestId>` 作成・作業・commit・push・作業報告生成までを **Kiro 自身**に実行させる（hook_server はコードで git を代行しない。認証 helper の仕込みと手順提示だけ用意する）。commit author は固定で `kiro-bot <kiro-bot@users.noreply.github.com>`。`baseBranch` 省略時は `main`。`repoUrl` 未指定なら従来どおり clone なしで prompt を実行する（後方互換）。
+- **GitHub 認証（方式A: PAT を Kiro に見せない）**: GitHub PAT は Secret `kiro-microvm/github-token` に入れる（実トークンは IaC/イメージに焼かない。`KIRO_API_KEY` と同思想）。`base-stack.ts` が executionRole にこの Secret の read 権限を付与し、`image-stack.ts` が env `GITHUB_TOKEN_SECRET_ARN`（ARN のみ）を注入する。hook_server は Kiro の HOME 配下に `GIT_ASKPASS` スクリプトを仕込み、`GIT_ASKPASS` / `GIT_TERMINAL_PROMPT=0` を Kiro の子プロセス env に渡す。git が資格情報を要求したときだけこのスクリプトが実行時に `aws secretsmanager get-secret-value` で PAT を取得して git に渡す。PAT 実値はプロンプトにも URL にも stdout にもスクリプト本文にも出さない。Kiro は PAT を知らずに HTTPS push できる。helper の一時ファイルは実行後に必ず削除する。PAT も `KIRO_API_KEY` と同じマスク対象に追加する（実値の完全一致置換に加え、`gh[pousr]_\S+` と旧 40 桁 hex 形式のパターン置換。ただし 40 桁 hex は git のコミット SHA / blob hash と衝突するため、成果物を put させず skip する fail-closed 判定には使わず、ログ・`status.json`・stdout のマスクにのみ使う）。
+- **作業報告の出力**: GitHub フローでは Kiro が `report.json`（機械可読: `summary`・`changes`・`limitations`・`branch`・`pushedCommit`）と `report.md`（PR 本文に貼れる形: 何をしたか／変更点／制限事項）を生成する。既存の成果物 put 経路に加え、hook_server が同 prefix に明示的にも put を試みる（生成失敗・put 失敗は `status.json` の `failedUploads` に残る）。
 - **`--trust-all-tools` の安全柵**: 人のいないゲストで承認待ちを出さないため全許可にする。承認は安全柵にならないので、代わりに executionRole の最小権限(result バケットへの put と当該 Secret の read のみ)と egress 制御(INTERNET_EGRESS)が安全柵を担う。
 - **時間制約の階層(非同期)**: 2 つの時間制約は別物。
   - `/run` の `RunTimeoutInSeconds`=60(`image-stack.ts`): `/run` が 200 を返すまでの上限(サービスモデル max=60)。即 200 を返すので 60 で十分。
@@ -79,7 +84,22 @@ AWS_PROFILE=work pnpm deploy
 AWS_PROFILE=work pnpm run-microvm
 AWS_PROFILE=work PROMPT="東京の天気を調べて weather.html を作って" pnpm run-microvm
 AWS_PROFILE=work pnpm run-microvm -- "東京の天気を調べて weather.html を作って"
+
+# GitHub フロー: repoUrl を指定すると clone→ブランチ作成→作業→commit→push→作業報告まで Kiro が実行する。
+#   prompt は PROMPT か第1引数、repoUrl は REPO_URL か第2引数、baseBranch は BASE_BRANCH(既定 main)で指示する。
+AWS_PROFILE=work REPO_URL="https://github.com/owner/repo.git" \
+  PROMPT="READMEに概要を追記して" pnpm run-microvm
+AWS_PROFILE=work pnpm run-microvm -- "READMEに概要を追記して" "https://github.com/owner/repo.git"
 ```
+
+### 入力（`--run-hook-payload` の JSON）
+
+run.sh が構造化して渡す。既存キーに加えて GitHub フロー用のキーを追加した。
+
+- `prompt`（動的指示）: Kiro への作業指示。省略時は既定（札幌の天気…）。
+- `repoUrl`（動的指示）: clone 対象の GitHub HTTPS URL。指定時だけ GitHub フローになる。省略で従来どおり clone なし。
+- `baseBranch`: ブランチ作成の起点。省略時 `main`。
+- `requestId` / `prefix`: 既存のまま（成果物の S3 prefix を決める）。
 
 個別に叩きたい場合は従来どおり `scripts/deploy.sh`・`scripts/package-image.sh`・`scripts/run.sh` を直接実行してもよい。`pnpm deploy` は内部でこの順序(BaseStack → `package-image.sh` → ImageStack)を実行する。
 
@@ -90,7 +110,14 @@ AWS_PROFILE=work aws secretsmanager put-secret-value \
   --secret-id kiro-microvm/kiro-api-key --secret-string 'ksk_...' --region ap-northeast-1
 ```
 
-期待結果: `runs/<requestId>/` 配下に `status.json`・`kiro-stdout.txt`・成果物(`weather.html` など)が出る。`run.sh` は `status.json` の出現を待ち、`ok` と `exitCode` を表示して `results/<requestId>/` に回収する。`ksk_` で始まる文字列は CloudWatch Logs・S3 の全オブジェクト・ホスト stdout のいずれにも出ない。
+GitHub フローを使う場合は、Secret `kiro-microvm/github-token` に GitHub PAT を投入しておく（実トークンは IaC/git に焼かない。方式A）。PAT には対象リポジトリへの push 権限が要る。
+
+```bash
+AWS_PROFILE=work aws secretsmanager put-secret-value \
+  --secret-id kiro-microvm/github-token --secret-string 'ghp_...' --region ap-northeast-1
+```
+
+期待結果: `runs/<requestId>/` 配下に `status.json`・`kiro-stdout.txt`・成果物(`weather.html` など)が出る。GitHub フローでは加えて `report.json`・`report.md` が同 prefix に出る。`run.sh` は `status.json` の出現を待ち、`ok` と `exitCode`（および作業報告の有無）を表示して `results/<requestId>/` に回収する。`ksk_` で始まる文字列と GitHub PAT は CloudWatch Logs・S3 の全オブジェクト・`report.*`・`status.json`・ホスト stdout のいずれにも出ない。既存の非同期実行モデル・時間制約の単調関係（`KIRO_TIMEOUT_SECONDS(1200) < --maximum-duration(1800) < ポーリング上限(1860)`）・二段マスク設計は変更していない（GitHub フローは既存経路への追加であって置き換えではない）。
 
 kiro-cli の配布 URL や版を変えるときは、`run-microvm` が AWS 側ビルドのため build-arg 経路が無い。`packages/image/Dockerfile` の `ARG KIRO_CLI_DL_URL` 既定値を直接編集 → 手順 4(`package-image.sh`)→ 手順 5(`cdk deploy KiroMicrovmImage`)で再ビルドする。
 

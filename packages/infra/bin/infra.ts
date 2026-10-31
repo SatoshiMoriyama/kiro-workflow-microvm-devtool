@@ -27,5 +27,6 @@ const image = new ImageStack(app, "KiroMicrovmImage", {
   buildRole: base.buildRole,
   logGroup: base.logGroup,
   apiKeySecret: base.apiKeySecret,
+  githubTokenSecret: base.githubTokenSecret,
 });
 image.addStackDependency(base);

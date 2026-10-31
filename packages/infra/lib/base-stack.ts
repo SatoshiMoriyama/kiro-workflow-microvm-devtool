@@ -25,6 +25,7 @@ export class BaseStack extends cdk.Stack {
   readonly executionRole: iam.Role;
   readonly logGroup: logs.LogGroup;
   readonly apiKeySecret: secretsmanager.Secret;
+  readonly githubTokenSecret: secretsmanager.Secret;
   readonly artifactKey = "code/app.zip";
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -75,6 +76,15 @@ export class BaseStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
+    // GitHub PAT を入れる器(KIRO_API_KEY と同思想)。実トークンは IaC/git に
+    // 焼かず、後から put-secret-value で投入する。方式A: ゲストの GIT_ASKPASS
+    // helper がこの Secret を実行時に取得し git に渡す(Kiro には見せない)。
+    this.githubTokenSecret = new secretsmanager.Secret(this, "GithubTokenSecret", {
+      secretName: "kiro-microvm/github-token",
+      description: "GitHub PAT(git push 用。値は put-secret-value で後から投入)",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     this.executionRole = new iam.Role(this, "ExecutionRole", {
       assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
       description: "MicroVM execution role: PutObject to result, read API key secret",
@@ -83,6 +93,8 @@ export class BaseStack extends cdk.Stack {
     this.logGroup.grantWrite(this.executionRole);
     // ゲストが短命 credential で KIRO_API_KEY を取得できるようにする。
     this.apiKeySecret.grantRead(this.executionRole);
+    // GitHub PAT も同じ短命 credential で取得できるようにする(GIT_ASKPASS 経由)。
+    this.githubTokenSecret.grantRead(this.executionRole);
 
     new cdk.CfnOutput(this, "ArtifactBucketName", {
       value: this.artifactBucket.bucketName,
@@ -100,6 +112,10 @@ export class BaseStack extends cdk.Stack {
     new cdk.CfnOutput(this, "ApiKeySecretArn", {
       value: this.apiKeySecret.secretArn,
       exportName: "KiroMicrovm-ApiKeySecretArn",
+    });
+    new cdk.CfnOutput(this, "GithubTokenSecretArn", {
+      value: this.githubTokenSecret.secretArn,
+      exportName: "KiroMicrovm-GithubTokenSecretArn",
     });
     new cdk.CfnOutput(this, "LogGroupName", {
       value: this.logGroup.logGroupName,

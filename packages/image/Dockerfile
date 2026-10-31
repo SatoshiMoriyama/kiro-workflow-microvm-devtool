@@ -4,11 +4,12 @@ FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
 # awscli(Secrets 取得・S3 put)・python3(フックサーバ)・kiro-cli 実行に要るツール。
 # unzip/tar は配布 zip の展開用、ca-certificates は HTTPS 取得に必須。
+# git は GitHub の clone/commit/push に必須(Kiro 自身が git を実行する)。
 # curl は dnf で入れない: フル版 curl は AL2023 プリインストールの curl-minimal と
 # 衝突し dnf 全体が失敗する(実機ビルドで確認)。Kiro の HTTP 取得は curl-minimal で足りる。
 # フル curl がどうしても要る場合のみ `dnf install -y --allowerasing curl` を別 RUN で行う。
-RUN { dnf install -y python3 awscli-2 unzip tar ca-certificates \
-      || dnf install -y python3 awscli unzip tar ca-certificates; } \
+RUN { dnf install -y python3 awscli-2 git unzip tar ca-certificates \
+      || dnf install -y python3 awscli git unzip tar ca-certificates; } \
     && dnf clean all
 
 # kiro-cli の配布 URL(既定値集約用の定数)。

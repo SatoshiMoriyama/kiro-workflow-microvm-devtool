@@ -211,7 +211,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
                 clear=False,
             ),
             unittest.mock.patch.object(
-                hs, "_fetch_api_key", return_value=("ksk_live", None)
+                hs, "_fetch_secret", return_value=("ksk_live", None)
             ),
             unittest.mock.patch.object(
                 hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
@@ -337,6 +337,304 @@ class TestRunKiroUploadFailures(unittest.TestCase):
         self.assertNotIn("ksk_live", json.dumps(status, ensure_ascii=False))
         # clean な成果物は引き続き put される。
         self.assertIn("weather.html", status["artifacts"])
+
+
+class TestMaskGithubToken(unittest.TestCase):
+    """GitHub トークン(新旧)と実 PAT 値が [REDACTED] に置換されること。"""
+
+    def test_new_format_token_pattern(self):
+        for prefix in ("ghp_", "gho_", "ghu_", "ghs_", "ghr_"):
+            tok = f"{prefix}AbCdEf0123456789"
+            masked = hs.mask_secret(f"url https://x:{tok}@github.com/a/b", None)
+            self.assertNotIn(tok, masked)
+            self.assertIn("[REDACTED]", masked)
+
+    def test_old_40hex_token_pattern(self):
+        tok = "0123456789abcdef0123456789abcdef01234567"  # 40 桁 hex
+        masked = hs.mask_secret(f"token={tok} end", None)
+        self.assertNotIn(tok, masked)
+        self.assertIn("[REDACTED]", masked)
+
+    def test_real_pat_value_exact_match(self):
+        pat = "ghp_realSecretValue123"
+        masked = hs.mask_secrets("leak " + pat + " here", [pat])
+        self.assertNotIn(pat, masked)
+
+    def test_mask_secrets_multiple_values(self):
+        masked = hs.mask_secrets(
+            "a=ksk_one b=ghp_two c=plainsecret",
+            ["plainsecret"],
+        )
+        # 実値(plainsecret)もパターン(ksk_/ghp_)も消える。
+        self.assertNotIn("plainsecret", masked)
+        self.assertNotIn("ksk_one", masked)
+        self.assertNotIn("ghp_two", masked)
+
+    def test_contains_secret_detects_github_token(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.txt")
+            with open(p, "w") as fh:
+                fh.write("remote url has ghp_abcdef123456 inside")
+            self.assertTrue(hs.contains_secret(p, None))
+
+    def test_name_contains_github_token(self):
+        self.assertTrue(hs.name_contains_secret("ghp_abc.txt", None))
+
+
+class TestResolveRepoInputs(unittest.TestCase):
+    def test_repo_url_present(self):
+        self.assertEqual(
+            hs.resolve_repo_url({"repoUrl": " https://github.com/a/b.git "}),
+            "https://github.com/a/b.git",
+        )
+
+    def test_repo_url_missing_none(self):
+        self.assertIsNone(hs.resolve_repo_url({}))
+        self.assertIsNone(hs.resolve_repo_url({"repoUrl": "   "}))
+        self.assertIsNone(hs.resolve_repo_url({"repoUrl": 123}))
+
+    def test_base_branch_default(self):
+        self.assertEqual(hs.resolve_base_branch({}), "main")
+        self.assertEqual(hs.resolve_base_branch({"baseBranch": "  "}), "main")
+        self.assertEqual(hs.resolve_base_branch({"baseBranch": 5}), "main")
+
+    def test_base_branch_present(self):
+        self.assertEqual(
+            hs.resolve_base_branch({"baseBranch": " develop "}), "develop"
+        )
+
+
+class TestGitCredentialHelper(unittest.TestCase):
+    def test_askpass_script_no_pat_value(self):
+        arn = "arn:aws:secretsmanager:ap-northeast-1:123:secret:gh-abc"
+        script = hs.render_askpass_script(arn)
+        # ARN は埋め込むが PAT 実値は本文に現れない(実行時取得する作り)。
+        self.assertIn(arn, script)
+        self.assertNotIn("ghp_", script)
+        self.assertIn("get-secret-value", script)
+
+    def test_build_git_env_fields(self):
+        env = hs.build_git_env("/tmp/home-x")
+        self.assertEqual(env["HOME"], "/tmp/home-x")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(
+            env["GIT_ASKPASS"], os.path.join("/tmp/home-x", hs.GIT_ASKPASS_FILENAME)
+        )
+
+    def test_setup_then_cleanup_removes_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = os.path.join(d, "home")
+            path = hs.setup_git_credentials(home, "arn:secret")
+            self.assertTrue(os.path.isfile(path))
+            # 実行権限が付く。
+            self.assertTrue(os.access(path, os.X_OK))
+            hs.cleanup_git_credentials(home)
+            self.assertFalse(os.path.exists(path))
+
+    def test_cleanup_missing_no_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            # 無くても落ちない。
+            hs.cleanup_git_credentials(d)
+
+
+class TestBuildRepoPrompt(unittest.TestCase):
+    def test_none_repo_passthrough(self):
+        self.assertEqual(
+            hs.build_repo_prompt(None, "main", "req-1", "do work"), "do work"
+        )
+
+    def test_repo_prompt_structure(self):
+        p = hs.build_repo_prompt(
+            "https://github.com/a/b.git", "main", "req-9", "作業内容"
+        )
+        # ブランチ名 kiro/<requestId>、固定 author、report スキーマへの言及。
+        self.assertIn("kiro/req-9", p)
+        self.assertIn(hs.GIT_AUTHOR_NAME, p)
+        self.assertIn(hs.GIT_AUTHOR_EMAIL, p)
+        self.assertIn("report.json", p)
+        self.assertIn("report.md", p)
+        self.assertIn("pushedCommit", p)
+        self.assertIn("作業内容", p)
+        # URL に認証情報を埋め込まない(@ を含む偽装 URL を書かない)。
+        self.assertNotIn("ghp_", p)
+        self.assertNotIn("@github.com", p)
+
+
+class TestRunKiroGithubFlow(unittest.TestCase):
+    """repoUrl 指定時のフロー: helper 設置/撤去・report put・PAT 非漏洩。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        self._req = os.path.basename(self._workdir.name)
+        self._pat = "ghp_realPatValue999"
+
+        patches = [
+            unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "RESULT_BUCKET": "bkt",
+                    "KIRO_API_KEY_SECRET_ARN": "arn:kiro",
+                    "GITHUB_TOKEN_SECRET_ARN": "arn:gh",
+                },
+                clear=False,
+            ),
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _fetch_secret_side(self, arn):
+        if arn == "arn:gh":
+            return (self._pat, None)
+        return ("ksk_live", None)
+
+    def _fake_kiro_run(self, reports):
+        """kiro-cli をモックし、呼ばれたら workdir に report を生成する。"""
+        def _run(cmd, *args, **kwargs):
+            # kiro-cli 実行の検知(第1要素)。
+            if cmd and cmd[0] == "kiro-cli":
+                wd = kwargs.get("cwd")
+                for name, content in reports.items():
+                    with open(os.path.join(wd, name), "w", encoding="utf-8") as fh:
+                        fh.write(content)
+                proc = unittest.mock.Mock()
+                proc.returncode = 0
+                proc.stdout = b"done"
+                return proc
+            proc = unittest.mock.Mock()
+            proc.returncode = 0
+            proc.stdout = b""
+            return proc
+        return _run
+
+    def test_github_flow_puts_reports_and_hides_pat(self):
+        reports = {
+            "report.json": json.dumps(
+                {
+                    "summary": "やったこと",
+                    "changes": ["a"],
+                    "limitations": [],
+                    "branch": f"kiro/{self._req}",
+                    "pushedCommit": "abc123",
+                }
+            ),
+            "report.md": "# 作業報告\n内容",
+        }
+        put_file = unittest.mock.Mock(return_value=(True, "s3://ok"))
+        with unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch_secret_side
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=self._fake_kiro_run(reports)
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業内容",
+                repo_url="https://github.com/a/b.git",
+                base_branch="main",
+            )
+        self.assertTrue(ok)
+        # report.json / report.md が成果物として put された。
+        self.assertIn("report.json", status["artifacts"])
+        self.assertIn("report.md", status["artifacts"])
+        # PAT 実値は status のどこにも出ない。
+        self.assertNotIn(self._pat, json.dumps(status, ensure_ascii=False))
+        # put した key にも PAT が出ない。
+        for call in put_file.call_args_list:
+            self.assertNotIn(self._pat, call.args[1])
+        # helper は実行後に撤去されている。
+        helper = os.path.join(
+            self._workdir.name, ".kiro-git-home", hs.GIT_ASKPASS_FILENAME
+        )
+        self.assertFalse(os.path.exists(helper))
+
+    def test_report_with_real_40hex_sha_not_skipped(self):
+        # pushedCommit は 40 桁 hex の git SHA。これを「秘密」と誤判定して
+        # report を skip しないこと(40hex は skip 判定に使わない設計)。
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        reports = {
+            "report.json": json.dumps(
+                {
+                    "summary": "s",
+                    "changes": [],
+                    "limitations": [],
+                    "branch": f"kiro/{self._req}",
+                    "pushedCommit": sha,
+                }
+            ),
+            "report.md": f"# 報告\ncommit {sha}",
+        }
+        put_file = unittest.mock.Mock(return_value=(True, "s3://ok"))
+        with unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch_secret_side
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=self._fake_kiro_run(reports)
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業内容",
+                repo_url="https://github.com/a/b.git",
+            )
+        self.assertIn("report.json", status["artifacts"])
+        self.assertIn("report.md", status["artifacts"])
+        self.assertNotIn("report.json", status["skippedArtifacts"])
+
+    def test_github_flow_missing_reports_recorded_as_failed(self):
+        # Kiro が report を生成しなかった場合、欠落が failedUploads に出る。
+        put_file = unittest.mock.Mock(return_value=(True, "s3://ok"))
+        with unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch_secret_side
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=self._fake_kiro_run({})
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
+            ok, status = hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業内容",
+                repo_url="https://github.com/a/b.git",
+            )
+        self.assertIn("report.json", status["failedUploads"])
+        self.assertIn("report.md", status["failedUploads"])
+        self.assertFalse(ok)
+
+    def test_helper_cleaned_up_even_on_kiro_exception(self):
+        def _raise(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "kiro-cli":
+                raise OSError("boom")
+            proc = unittest.mock.Mock()
+            proc.returncode = 0
+            proc.stdout = b""
+            return proc
+        with unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch_secret_side
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=_raise
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            hs.run_kiro_and_upload(
+                f"runs/{self._req}/",
+                self._req,
+                "作業内容",
+                repo_url="https://github.com/a/b.git",
+            )
+        helper = os.path.join(
+            self._workdir.name, ".kiro-git-home", hs.GIT_ASKPASS_FILENAME
+        )
+        self.assertFalse(os.path.exists(helper))
 
 
 if __name__ == "__main__":

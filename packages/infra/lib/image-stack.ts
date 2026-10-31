@@ -14,6 +14,7 @@ export interface ImageStackProps extends cdk.StackProps {
   readonly buildRole: iam.IRole;
   readonly logGroup: logs.ILogGroup;
   readonly apiKeySecret: secretsmanager.ISecret;
+  readonly githubTokenSecret: secretsmanager.ISecret;
 }
 
 /**
@@ -72,6 +73,11 @@ export class ImageStack extends cdk.Stack {
         {
           key: "KIRO_API_KEY_SECRET_ARN",
           value: props.apiKeySecret.secretArn,
+        },
+        // GitHub PAT も ARN のみ注入。ゲストの GIT_ASKPASS helper が実行時に取得する。
+        {
+          key: "GITHUB_TOKEN_SECRET_ARN",
+          value: props.githubTokenSecret.secretArn,
         },
       ],
       // ready/run はフックの有効化フラグ(ENABLED/DISABLED)。
