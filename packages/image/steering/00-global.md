@@ -1,3 +1,7 @@
+---
+inclusion: always
+---
+
 <!--
 このファイルは MicroVM(AWS Lambda MicroVMs)内で headless 実行される kiro-cli 専用の
 グローバル steering。Dockerfile で /root/.kiro/steering/ へ COPY され、KIRO_HOME=/root/.kiro
@@ -6,9 +10,6 @@
 無関係で、手元 Kiro の挙動には一切影響しない。本文を更新したら再デプロイが必要
 (package-image.sh が内容ハッシュを更新 -> CFN 再ビルド)。
 -->
----
-inclusion: always
----
 
 # MicroVM 内 kiro-cli 共通注意事項
 

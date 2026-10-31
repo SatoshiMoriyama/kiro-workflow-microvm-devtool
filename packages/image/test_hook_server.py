@@ -1255,7 +1255,11 @@ class TestGlobalSteering(unittest.TestCase):
         self.assertIn("00-global.md", text)
         self.assertIn(hs.GLOBAL_STEERING_DIR, text)
         self.assertIn("git add", text)
-        self.assertIn("commit/push に含めない", text)
+        # mkdir と .git/info/exclude 追記で、git add -A から確実に除外する。
+        self.assertIn("mkdir -p .kiro/steering", text)
+        self.assertIn(".git/info/exclude", text)
+        self.assertIn("echo '.kiro/steering/00-global.md' >> .git/info/exclude", text)
+        self.assertIn("commit/push に含まれない", text)
 
     def test_none_repo_passthrough_unchanged_with_steering(self):
         # steering が焼かれていても repoUrl=None は user_prompt を素通し。
@@ -1279,7 +1283,11 @@ class TestGlobalSteering(unittest.TestCase):
             )
         self.assertIn(".kiro/steering/00-global.md", p)
         self.assertIn("git add", p)
-        self.assertIn("commit/push に含めない", p)
+        self.assertIn("mkdir -p .kiro/steering", p)
+        self.assertIn(
+            "echo '.kiro/steering/00-global.md' >> .git/info/exclude", p
+        )
+        self.assertIn("commit/push に含まれない", p)
         # clone(手順1)の後、config(手順2)の前に差し込まれる。
         self.assertLess(p.index("git clone"), p.index(".kiro/steering/00-global.md"))
         self.assertLess(

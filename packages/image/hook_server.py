@@ -482,8 +482,9 @@ def build_steering_fallback_instructions(steering_files):
 
     clone 後、リポジトリ直下の .kiro/steering/<name>.md が無ければ、イメージ同梱の
     /root/.kiro/steering/<name>.md をコピーして配置し、その内容を遵守させる。これらの
-    steering ファイルは対象リポジトリの履歴を汚さないよう commit/push に含めない
-    (git add 対象から除外する)。steering_files が空なら空文字列を返す(従来プロンプト
+    steering ファイルは対象リポジトリの履歴を汚さないよう commit/push に含めない。
+    手順5の `git add -A` でも拾わせないため、配置した各ファイルのパスを
+    .git/info/exclude に追記させる。steering_files が空なら空文字列を返す(従来プロンプト
     と同一の文面を保つ)。
     """
     files = list(steering_files or ())
@@ -493,13 +494,19 @@ def build_steering_fallback_instructions(steering_files):
     for name, _text in files:
         src = os.path.join(GLOBAL_STEERING_DIR, name)
         dst = os.path.join(GLOBAL_STEERING_WORKSPACE_SUBDIR, name)
-        lines.append(f"     - `{dst}` が無ければ `{src}` をコピーして配置する。")
+        lines.append(
+            f"     - `{dst}` が無ければ `{src}` をコピーして配置し、"
+            f"`echo '{dst}' >> .git/info/exclude` でこのパスを除外対象に追記する。"
+        )
     placements = "\n".join(lines)
     return (
-        "   clone したリポジトリ直下に共通注意事項の steering を配置し、その内容を遵守する:\n"
+        "   clone したリポジトリ直下に共通注意事項の steering を配置し、その内容を遵守する。"
+        f"まず `mkdir -p {GLOBAL_STEERING_WORKSPACE_SUBDIR}` でディレクトリを用意し、"
+        "各ファイルを配置する:\n"
         f"{placements}\n"
         f"     これら `{GLOBAL_STEERING_WORKSPACE_SUBDIR}/` の steering ファイルは "
-        "`git add` の対象から除外し、commit/push に含めない。\n"
+        "`.git/info/exclude` に追記済みのため、手順5の `git add -A` でも拾われず "
+        "commit/push に含まれない。\n"
     )
 
 
