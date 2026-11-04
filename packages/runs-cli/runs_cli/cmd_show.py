@@ -60,6 +60,14 @@ def _print_run(run, out) -> None:
         print("broken: この run は status.json が欠損/破損しています", file=out)
         print(f"requestId: {run.request_id}", file=out)
         print(f"path: {run.path}", file=out)
+        # broken でも report.md があれば末尾に出す。
+        report_md = _read_report_md(run)
+        if report_md is not None:
+            print("", file=out)
+            print("--- report.md ---", file=out)
+            out.write(report_md)
+            if not report_md.endswith("\n"):
+                out.write("\n")
         return
 
     print(f"requestId: {run.request_id}", file=out)
