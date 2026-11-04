@@ -17,7 +17,8 @@ MicroVM 上で動く kiro-cli に 1 件の依頼を投げ、完了後に S3 へ�
 
 - 対象ワークスペースは `kiro-workflow-microvm-devtool`。`pnpm run-microvm` が `scripts/run.sh` を呼ぶ。
 - デプロイ済み(Base/Image スタック、MicroVM イメージ)で、Secret `kiro-microvm/kiro-api-key`、GitHub フローを使うなら `kiro-microvm/github-token` に値が入っていること。未デプロイ・未投入ならその旨をユーザーに伝えて中断する(このスキルはデプロイ・PAT 投入をしない)。
-- AWS プロファイル既定 `work`、リージョン `ap-northeast-1`。SSO トークン切れ(`Token has expired`)なら、ユーザーに `aws sso login --profile work` を促して中断する。
+- **AWS プロファイルは必須入力。既定のフォールバックは無い**(公開前提で環境依存のプロファイル名を決め打ちしない)。毎回ユーザーに聞く(下記ステップ 1)。`scripts/run.sh` も `AWS_PROFILE` 未指定ならエラーで止まる。
+- リージョンは `ap-northeast-1`(MicroVMs 提供リージョン)。SSO トークン切れ(`Token has expired`)なら、ユーザーに `aws sso login --profile <指定プロファイル>` を促して中断する。
 
 ## 手順
 
@@ -25,6 +26,7 @@ MicroVM 上で動く kiro-cli に 1 件の依頼を投げ、完了後に S3 へ�
 
 既定値を仮定せず、毎回確認する:
 
+- **AWS_PROFILE**(必須): 使用する AWS プロファイル名。既定値を仮定せず必ず聞く(公開前提でフォールバックを置かない方針)。これを `AWS_PROFILE=<profile>` として実行コマンドに前置する。
 - **PROMPT**(必須): MicroVM 内の kiro-cli にやらせる作業内容。
 - **REPO_URL**(任意): GitHub フロー(clone→ブランチ作成→作業→commit→push→report 生成)をさせる場合の対象リポジトリ。`https://github.com/owner/repo.git` 形式のみ(`scripts/run.sh` / hook_server が `https://github.com/` 直下に限定)。
   - **空ならGitHub フローなし**で、PROMPT の作業だけ実行して成果物を S3 に出す従来モードになる。「リポジトリ作業をするか」をユーザーに確認し、する場合のみ REPO_URL を聞く。
@@ -34,10 +36,12 @@ MicroVM 上で動く kiro-cli に 1 件の依頼を投げ、完了後に S3 へ�
 
 ワークスペースルートで次を実行する。長時間(VM 寿命は最大 1800s、ホストポーリング上限 1860s)かかりうるので、タイムアウトを十分長く取る(1800000ms 程度)。
 
+`<profile>` はステップ 1 でユーザーに聞いた AWS プロファイル名に置き換える。
+
 GitHub フロー(REPO_URL あり)の場合:
 
 ```bash
-AWS_PROFILE=work \
+AWS_PROFILE=<profile> \
 REPO_URL="https://github.com/owner/repo.git" \
 PROMPT="<ユーザーが指定した作業内容>" \
 pnpm run-microvm
@@ -46,7 +50,7 @@ pnpm run-microvm
 従来モード(REPO_URL なし)の場合:
 
 ```bash
-AWS_PROFILE=work PROMPT="<ユーザーが指定した作業内容>" pnpm run-microvm
+AWS_PROFILE=<profile> PROMPT="<ユーザーが指定した作業内容>" pnpm run-microvm
 ```
 
 - BASE_BRANCH を変える場合は `BASE_BRANCH="<branch>"` を前置する。

@@ -2,18 +2,21 @@
 # MicroVM を起動し、/run フックが S3 に吐いた結果を回収して終了する。
 #
 # 前提: cdk deploy 済み + scripts/package-image.sh でイメージビルド済み。
-# 使い方:
-#   AWS_PROFILE=work ./scripts/run.sh
-#   AWS_PROFILE=work PROMPT="東京の天気を調べて weather.html を作って" ./scripts/run.sh
-#   AWS_PROFILE=work ./scripts/run.sh "東京の天気を調べて weather.html を作って"
+# 使い方(AWS_PROFILE は必須。既定のフォールバックは無い):
+#   AWS_PROFILE=<profile> ./scripts/run.sh
+#   AWS_PROFILE=<profile> PROMPT="東京の天気を調べて weather.html を作って" ./scripts/run.sh
+#   AWS_PROFILE=<profile> ./scripts/run.sh "東京の天気を調べて weather.html を作って"
 #   # GitHub フロー(clone→ブランチ作成→作業→commit→push→作業報告):
-#   AWS_PROFILE=work REPO_URL="https://github.com/owner/repo.git" \
+#   AWS_PROFILE=<profile> REPO_URL="https://github.com/owner/repo.git" \
 #     PROMPT="READMEに概要を追記して" ./scripts/run.sh
-#   AWS_PROFILE=work ./scripts/run.sh "READMEに概要を追記して" "https://github.com/owner/repo.git"
+#   AWS_PROFILE=<profile> ./scripts/run.sh "READMEに概要を追記して" "https://github.com/owner/repo.git"
 set -euo pipefail
 
 REGION="${AWS_REGION:-ap-northeast-1}"
-PROFILE="${AWS_PROFILE:-work}"
+# AWS プロファイルは必須。フォールバック既定は置かない(公開前提、環境依存のプロファイル名を
+# 決め打ちしない)。AWS_PROFILE 未指定なら明示エラーで止める。
+PROFILE="${AWS_PROFILE:-}"
+[[ -n "$PROFILE" ]] || { echo "ERROR: AWS_PROFILE が未指定。例: AWS_PROFILE=<profile> pnpm run-microvm" >&2; exit 1; }
 STACK="${STACK_NAME:-KiroMicrovmBase}"
 IMAGE_NAME="${MICROVM_IMAGE_NAME:-kiro-microvm}"
 
