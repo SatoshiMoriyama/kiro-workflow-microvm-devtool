@@ -17,7 +17,6 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from runs_cli import loader  # noqa: E402
-from runs_cli import cmd_stats  # noqa: E402
 
 
 def _write_json(path: str, obj) -> None:
@@ -179,13 +178,66 @@ class TestLoader(unittest.TestCase):
         missing = os.path.join(self.results_dir, "does-not-exist")
         self.assertEqual(loader.load_runs(missing), [])
 
+    def test_non_dict_status_is_broken(self):
+        # status.json が有効 JSON だが dict でない(list/null/文字列)と broken。
+        for name, payload in (
+            ("req-list", []),
+            ("req-null", None),
+            ("req-str", "just a string"),
+        ):
+            d = _make_run_dir(self.results_dir, name)
+            _write_json(os.path.join(d, "status.json"), payload)
 
-import io  # noqa: E402
+        runs = {r.request_id: r for r in loader.load_runs(self.results_dir)}
+        for name in ("req-list", "req-null", "req-str"):
+            self.assertIn(name, runs)
+            self.assertTrue(runs[name].broken, f"{name} should be broken")
+            self.assertIsNone(runs[name].ok)
+
+    def test_non_dict_report_keeps_status_report_none(self):
+        # report.json が非 dict のとき status 部分は保持し report 側は None。
+        for name, payload in (
+            ("req-rlist", []),
+            ("req-rnull", None),
+            ("req-rstr", "oops"),
+        ):
+            d = _make_run_dir(self.results_dir, name)
+            _write_json(
+                os.path.join(d, "status.json"),
+                self._valid_status(requestId=name),
+            )
+            _write_json(os.path.join(d, "report.json"), payload)
+
+        runs = {r.request_id: r for r in loader.load_runs(self.results_dir)}
+        for name in ("req-rlist", "req-rnull", "req-rstr"):
+            self.assertIn(name, runs)
+            run = runs[name]
+            # status 側は保持(broken にならず ok は True)。
+            self.assertFalse(run.broken, f"{name} should keep status")
+            self.assertIs(run.ok, True)
+            # report 側は None。
+            self.assertIsNone(run.branch)
+            self.assertIsNone(run.pushed_commit)
+            self.assertIsNone(run.summary)
+
+    def test_duration_seconds_none_when_tz_mixed(self):
+        # started_at が aware、finished_at が naive(tz 混在)なら None。
+        d = _make_run_dir(self.results_dir, "req-tz")
+        _write_json(
+            os.path.join(d, "status.json"),
+            self._valid_status(
+                startedAt="2026-11-04T20:00:00+00:00",
+                finishedAt="2026-11-04T20:00:42",
+            ),
+        )
+        run = loader.load_runs(self.results_dir)[0]
+        self.assertIsNone(loader.duration_seconds(run))
+
+
 from contextlib import redirect_stdout, redirect_stderr  # noqa: E402
 
 from runs_cli import cmd_list  # noqa: E402
 from runs_cli import cmd_stats  # noqa: E402
-
 
 class _Args:
     """cmd_list.run に渡す args の最小スタブ。"""
@@ -459,6 +511,22 @@ class TestCmdShow(unittest.TestCase):
         self.assertIn("broken", out)
         self.assertIn("req-broken", out)
 
+    def test_broken_run_with_report_md_appended(self):
+        # broken な run でも report.md があれば末尾に出す。
+        d = _make_run_dir(self.results_dir, "req-broken-md")
+        with open(os.path.join(d, "status.json"), "w", encoding="utf-8") as f:
+            f.write("{ not valid json ")
+        with open(os.path.join(d, "report.md"), "w", encoding="utf-8") as f:
+            f.write("# 壊れ run のレポート\n途中結果の本文。\n")
+        code, out = self._run_show("req-broken-md")
+        self.assertEqual(code, 0)
+        self.assertIn("broken", out)
+        self.assertIn("--- report.md ---", out)
+        self.assertIn("# 壊れ run のレポート", out)
+        self.assertIn("途中結果の本文。", out)
+        # broken 表示の後に report.md が出る。
+        self.assertLess(out.index("broken"), out.index("--- report.md ---"))
+
     def test_report_fields_from_report_json(self):
         self._make_run(
             "req-alpha-123",
@@ -524,7 +592,6 @@ class TestCmdStats(unittest.TestCase):
             self.json = json
 
     def _capture(self, runs, args):
-        import io
         import contextlib
 
         buf = io.StringIO()
@@ -583,6 +650,81 @@ class TestCmdStats(unittest.TestCase):
         self.assertEqual(rc, 0)
         # 0 件のとき成功率・平均は N/A 表示。
         self.assertIn("N/A", out)
+
+    def test_total_equals_ok_plus_failed_plus_broken(self):
+        # ok=None かつ非 broken の run を含めても
+        # total == ok + failed + broken が常に成立する。
+        runs = [
+            self._run("req-ok", ok=True),
+            self._run("req-false", ok=False),
+            self._run("req-none", ok=None),       # 非 broken・ok None -> failed
+            self._run("req-broken", ok=None, broken=True),
+        ]
+        rc, out = self._capture(runs, self._Args(json=True))
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        self.assertEqual(
+            data["total"], data["ok"] + data["failed"] + data["broken"]
+        )
+        self.assertEqual(data["total"], 4)
+        self.assertEqual(data["ok"], 1)
+        self.assertEqual(data["failed"], 2)
+        self.assertEqual(data["broken"], 1)
+
+
+class TestMainDispatch(unittest.TestCase):
+    """runs_cli.__main__.main(argv) 経由のディスパッチを検証する。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.results_dir = self._tmp.name
+        d = _make_run_dir(self.results_dir, "req-main-1")
+        _write_json(
+            os.path.join(d, "status.json"),
+            {
+                "requestId": "req-main-1",
+                "prompt": "p",
+                "exitCode": 0,
+                "timedOut": False,
+                "artifacts": [],
+                "skippedArtifacts": [],
+                "failedUploads": [],
+                "startedAt": "2026-11-04T20:00:00+00:00",
+                "finishedAt": "2026-11-04T20:00:10+00:00",
+                "ok": True,
+            },
+        )
+        from runs_cli import __main__ as main_mod
+
+        self.main = main_mod.main
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run_main(self, argv):
+        buf = io.StringIO()
+        old = sys.stdout
+        try:
+            sys.stdout = buf
+            code = self.main(argv)
+        finally:
+            sys.stdout = old
+        return code, buf.getvalue()
+
+    def test_list_dispatch_exit_zero(self):
+        code, out = self._run_main(
+            ["list", "--results-dir", self.results_dir]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("req-main-1", out)
+
+    def test_stats_dispatch_exit_zero(self):
+        code, out = self._run_main(
+            ["stats", "--results-dir", self.results_dir, "--json"]
+        )
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(data["total"], 1)
 
 
 if __name__ == "__main__":

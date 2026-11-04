@@ -107,20 +107,33 @@ def load_runs(results_dir: str) -> list[Run]:
         status_path = os.path.join(sub, "status.json")
         try:
             status = _read_json(status_path)
-            run = _run_from_status(name, abs_dir, status)
         except (FileNotFoundError, ValueError, OSError):
             runs.append(_broken_run(name, abs_dir))
             continue
+
+        # status.json が有効 JSON でも dict でない(例 []/null/文字列)場合は
+        # status.get が AttributeError になるため broken 扱いにする。
+        if not isinstance(status, dict):
+            runs.append(_broken_run(name, abs_dir))
+            continue
+
+        run = _run_from_status(name, abs_dir, status)
 
         report_path = os.path.join(sub, "report.json")
         if os.path.isfile(report_path):
             try:
                 report = _read_json(report_path)
+            except (ValueError, OSError):
+                # report.json が壊れている: status 部分は保持し report 側のみ None。
+                report = None
+
+            # report.json が dict のときだけ get で取り込む。
+            # 非 dict/壊れ時は status 側を保持し report 側のみ None とする。
+            if isinstance(report, dict):
                 run.branch = report.get("branch")
                 run.pushed_commit = report.get("pushedCommit")
                 run.summary = report.get("summary")
-            except (ValueError, OSError):
-                # report.json が壊れている: status 部分は保持し report 側のみ None。
+            else:
                 run.branch = None
                 run.pushed_commit = None
                 run.summary = None
@@ -141,9 +154,11 @@ def duration_seconds(run: Run) -> float | None:
     try:
         start = datetime.fromisoformat(run.started_at)
         finish = datetime.fromisoformat(run.finished_at)
+        # tz 有無が異なる(aware と naive の混在)と減算で TypeError になるため
+        # 減算も try に含めて None にフォールバックする。
+        return (finish - start).total_seconds()
     except (ValueError, TypeError):
         return None
-    return (finish - start).total_seconds()
 
 
 def default_results_dir() -> str:

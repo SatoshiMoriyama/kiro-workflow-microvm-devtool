@@ -7,7 +7,9 @@ load_runs が返す Run のリストを集計し、人間向け整形表示ま�
 集計の定義(テストで固定する):
 - 総 run 数   : runs の総数。
 - 成功数(ok)  : ok is True の run 数。
-- 失敗数      : ok is False かつ broken でない run 数。
+- 失敗数      : ok が True でない かつ broken でない run 数
+                (ok is False だけでなく ok is None も含む)。
+                total == ok + failed + broken が常に成立する。
 - 壊れ数      : broken is True の run 数。
 - 成功率(%)   : 成功数 / 総 run 数 * 100。分母は「全 run」(broken も含む)。
                 総 run 数が 0 のときは None 相当とする。
@@ -27,8 +29,10 @@ def _aggregate(runs: list[Run]) -> dict:
     total = len(runs)
     broken = sum(1 for r in runs if r.broken)
     ok = sum(1 for r in runs if r.ok is True)
-    # 失敗は「ok が明示的に False」かつ「broken でない」run に限定する。
-    failed = sum(1 for r in runs if r.broken is False and r.ok is False)
+    # 失敗は「ok が True でない」かつ「broken でない」run とする。
+    # こうすると total == ok + failed + broken が常に成立する
+    # (ok=None かつ非 broken の run も failed に含まれる)。
+    failed = sum(1 for r in runs if not r.broken and r.ok is not True)
 
     # 成功率の分母は全 run(broken を含む)。総数 0 のときは None。
     success_rate = (ok / total * 100.0) if total > 0 else None
