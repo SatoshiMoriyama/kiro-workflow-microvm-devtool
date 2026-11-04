@@ -7,6 +7,7 @@ loader 以外(cmd_list / cmd_show / cmd_stats)のテストは並列タスクが
 このリード部分では TestLoader のみを定義しクラス名の衝突を避ける。
 """
 
+import io
 import json
 import os
 import sys
@@ -176,6 +177,148 @@ class TestLoader(unittest.TestCase):
     def test_missing_results_dir_returns_empty(self):
         missing = os.path.join(self.results_dir, "does-not-exist")
         self.assertEqual(loader.load_runs(missing), [])
+
+
+class _Args:
+    """argparse.Namespace 相当の簡易 args(cmd_show.run に渡す)。"""
+
+    def __init__(self, request_id, results_dir=None):
+        self.request_id = request_id
+        self.results_dir = results_dir
+
+
+class TestCmdShow(unittest.TestCase):
+    """cmd_show.run の振る舞いを検証する(TestLoader とは独立)。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.results_dir = self._tmp.name
+        # cmd_show を遅延 import(loader 以外のモジュール依存を局所化)。
+        from runs_cli import cmd_show  # noqa: E402
+
+        self.cmd_show = cmd_show
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _valid_status(self, **overrides):
+        status = {
+            "requestId": "req-alpha-123",
+            "prompt": "do something",
+            "exitCode": 0,
+            "timedOut": False,
+            "artifacts": ["a.txt", "b.txt"],
+            "skippedArtifacts": [],
+            "failedUploads": [],
+            "startedAt": "2026-11-04T20:00:00+00:00",
+            "finishedAt": "2026-11-04T20:00:42+00:00",
+            "ok": True,
+        }
+        status.update(overrides)
+        return status
+
+    def _make_run(self, name, status=None, report=None, report_md=None):
+        d = _make_run_dir(self.results_dir, name)
+        st = self._valid_status(requestId=name) if status is None else status
+        _write_json(os.path.join(d, "status.json"), st)
+        if report is not None:
+            _write_json(os.path.join(d, "report.json"), report)
+        if report_md is not None:
+            with open(os.path.join(d, "report.md"), "w", encoding="utf-8") as f:
+                f.write(report_md)
+        return d
+
+    def _run_show(self, request_id):
+        """cmd_show.run を実行し (exit_code, stdout) を返す。"""
+        runs = loader.load_runs(self.results_dir)
+        args = _Args(request_id=request_id, results_dir=self.results_dir)
+        buf = io.StringIO()
+        old = sys.stdout
+        try:
+            sys.stdout = buf
+            code = self.cmd_show.run(runs, args)
+        finally:
+            sys.stdout = old
+        return code, buf.getvalue()
+
+    def test_exact_match_displays(self):
+        self._make_run("req-alpha-123")
+        code, out = self._run_show("req-alpha-123")
+        self.assertEqual(code, 0)
+        self.assertIn("requestId: req-alpha-123", out)
+        self.assertIn("exit_code=0", out)
+        self.assertIn("timed_out=False", out)
+        self.assertIn("prompt: do something", out)
+        self.assertIn("a.txt", out)
+
+    def test_prefix_shortened_match(self):
+        self._make_run("req-alpha-123")
+        self._make_run("req-beta-999")
+        # "req-alpha" は req-alpha-123 のみに前方一致する。
+        code, out = self._run_show("req-alpha")
+        self.assertEqual(code, 0)
+        self.assertIn("requestId: req-alpha-123", out)
+
+    def test_exact_preferred_over_prefix(self):
+        # "req-1" が完全一致で存在し、"req-12" も前方一致で存在するケース。
+        self._make_run("req-1")
+        self._make_run("req-12")
+        code, out = self._run_show("req-1")
+        self.assertEqual(code, 0)
+        self.assertIn("requestId: req-1", out)
+        # 完全一致を優先するので候補列挙にはならない。
+        self.assertNotIn("候補", out)
+
+    def test_multiple_prefix_matches_list_candidates(self):
+        self._make_run("req-alpha-1")
+        self._make_run("req-alpha-2")
+        code, out = self._run_show("req-alpha")
+        self.assertNotEqual(code, 0)
+        self.assertIn("req-alpha-1", out)
+        self.assertIn("req-alpha-2", out)
+
+    def test_no_match_fails(self):
+        self._make_run("req-alpha-123")
+        code, out = self._run_show("does-not-exist")
+        self.assertNotEqual(code, 0)
+        self.assertIn("does-not-exist", out)
+
+    def test_report_md_appended(self):
+        self._make_run(
+            "req-alpha-123",
+            report_md="# レポート本文\nこれは report.md の中身です。\n",
+        )
+        code, out = self._run_show("req-alpha-123")
+        self.assertEqual(code, 0)
+        self.assertIn("# レポート本文", out)
+        self.assertIn("これは report.md の中身です。", out)
+        # report.md はフィールド表示の末尾に出る。
+        self.assertLess(out.index("requestId:"), out.index("# レポート本文"))
+
+    def test_report_md_absent_not_printed(self):
+        self._make_run("req-alpha-123")
+        code, out = self._run_show("req-alpha-123")
+        self.assertEqual(code, 0)
+        self.assertNotIn("report.md", out)
+
+    def test_broken_run_shows_broken(self):
+        d = _make_run_dir(self.results_dir, "req-broken")
+        with open(os.path.join(d, "status.json"), "w", encoding="utf-8") as f:
+            f.write("{ not valid json ")
+        code, out = self._run_show("req-broken")
+        self.assertEqual(code, 0)
+        self.assertIn("broken", out)
+        self.assertIn("req-broken", out)
+
+    def test_report_fields_from_report_json(self):
+        self._make_run(
+            "req-alpha-123",
+            report={"branch": "kiro/x", "pushedCommit": "deadbeef", "summary": "s"},
+        )
+        code, out = self._run_show("req-alpha-123")
+        self.assertEqual(code, 0)
+        self.assertIn("branch: kiro/x", out)
+        self.assertIn("pushedCommit: deadbeef", out)
 
 
 if __name__ == "__main__":
