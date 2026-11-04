@@ -178,5 +178,152 @@ class TestLoader(unittest.TestCase):
         self.assertEqual(loader.load_runs(missing), [])
 
 
+import io  # noqa: E402
+from contextlib import redirect_stdout, redirect_stderr  # noqa: E402
+
+from runs_cli import cmd_list  # noqa: E402
+
+
+class _Args:
+    """cmd_list.run に渡す args の最小スタブ。"""
+
+    def __init__(self, results_dir=".", ok_only=False, failed_only=False):
+        self.results_dir = results_dir
+        self.ok_only = ok_only
+        self.failed_only = failed_only
+
+
+def _make_run(request_id, ok=None, exit_code=None, timed_out=None,
+              artifacts=None, finished_at=None, broken=False):
+    """テスト用に Run を直接組み立てる(loader の公開フィールドを使用)。"""
+    return loader.Run(
+        request_id=request_id,
+        ok=ok,
+        exit_code=exit_code,
+        timed_out=timed_out,
+        artifacts=artifacts or [],
+        skipped_artifacts=[],
+        failed_uploads=[],
+        started_at=None,
+        finished_at=finished_at,
+        prompt=None,
+        branch=None,
+        pushed_commit=None,
+        summary=None,
+        path="/tmp/" + request_id,
+        broken=broken,
+    )
+
+
+class TestCmdList(unittest.TestCase):
+    def _capture(self, runs, **arg_kwargs):
+        """cmd_list.run を実行し (exit_code, stdout, stderr) を返す。"""
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cmd_list.run(runs, _Args(**arg_kwargs))
+        return code, out.getvalue(), err.getvalue()
+
+    def _data_lines(self, stdout):
+        """ヘッダ行を除いたデータ行(request_id のみ先頭トークンで抽出)。"""
+        lines = [ln for ln in stdout.splitlines() if ln.strip()]
+        # 先頭はヘッダ。
+        return [ln.split()[0] for ln in lines[1:]]
+
+    def test_header_present_and_order(self):
+        runs = [_make_run("req-1", ok=True,
+                           finished_at="2026-11-04T20:00:00+00:00")]
+        code, out, _ = self._capture(runs)
+        self.assertEqual(code, 0)
+        header = out.splitlines()[0].split()
+        self.assertEqual(
+            header,
+            ["REQUEST_ID", "OK", "EXIT", "TIMED_OUT", "ARTIFACTS", "WHEN"],
+        )
+
+    def test_sorted_by_finished_at_desc(self):
+        runs = [
+            _make_run("old", ok=True,
+                      finished_at="2026-11-01T10:00:00+00:00"),
+            _make_run("new", ok=True,
+                      finished_at="2026-11-03T10:00:00+00:00"),
+            _make_run("mid", ok=True,
+                      finished_at="2026-11-02T10:00:00+00:00"),
+        ]
+        _, out, _ = self._capture(runs)
+        self.assertEqual(self._data_lines(out), ["new", "mid", "old"])
+
+    def test_missing_finished_at_sorts_last(self):
+        runs = [
+            _make_run("has-time", ok=True,
+                      finished_at="2026-11-02T10:00:00+00:00"),
+            _make_run("no-time", ok=True, finished_at=None),
+            _make_run("has-time2", ok=True,
+                      finished_at="2026-11-03T10:00:00+00:00"),
+        ]
+        _, out, _ = self._capture(runs)
+        self.assertEqual(
+            self._data_lines(out), ["has-time2", "has-time", "no-time"]
+        )
+
+    def test_broken_displayed_as_broken(self):
+        runs = [_make_run("req-broken", broken=True, finished_at=None)]
+        _, out, _ = self._capture(runs)
+        # OK 列(2 番目のトークン)が broken。
+        data_line = [ln for ln in out.splitlines() if ln.strip()][1]
+        self.assertEqual(data_line.split()[1], "broken")
+
+    def test_ok_only_filter(self):
+        runs = [
+            _make_run("ok-run", ok=True,
+                      finished_at="2026-11-03T10:00:00+00:00"),
+            _make_run("fail-run", ok=False,
+                      finished_at="2026-11-02T10:00:00+00:00"),
+            _make_run("broken-run", broken=True,
+                      finished_at="2026-11-01T10:00:00+00:00"),
+        ]
+        _, out, _ = self._capture(runs, ok_only=True)
+        self.assertEqual(self._data_lines(out), ["ok-run"])
+
+    def test_failed_only_filter_includes_broken(self):
+        runs = [
+            _make_run("ok-run", ok=True,
+                      finished_at="2026-11-03T10:00:00+00:00"),
+            _make_run("fail-run", ok=False,
+                      finished_at="2026-11-02T10:00:00+00:00"),
+            _make_run("broken-run", broken=True,
+                      finished_at="2026-11-01T10:00:00+00:00"),
+        ]
+        _, out, _ = self._capture(runs, failed_only=True)
+        # broken は failed に含める方針。降順で fail-run, broken-run の順。
+        self.assertEqual(self._data_lines(out), ["fail-run", "broken-run"])
+
+    def test_both_filters_is_error(self):
+        runs = [_make_run("req-1", ok=True,
+                          finished_at="2026-11-03T10:00:00+00:00")]
+        code, out, err = self._capture(runs, ok_only=True, failed_only=True)
+        self.assertEqual(code, 2)
+        self.assertNotEqual(err.strip(), "")
+
+    def test_artifacts_truncated(self):
+        runs = [
+            _make_run(
+                "req-1", ok=True,
+                artifacts=["a", "b", "c", "d", "e"],
+                finished_at="2026-11-03T10:00:00+00:00",
+            )
+        ]
+        _, out, _ = self._capture(runs)
+        self.assertIn("a,b,c,…", out)
+        self.assertNotIn("a,b,c,d", out)
+
+    def test_empty_runs_prints_header_only(self):
+        code, out, _ = self._capture([])
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        self.assertEqual(code, 0)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].split()[0], "REQUEST_ID")
+
+
 if __name__ == "__main__":
     unittest.main()
