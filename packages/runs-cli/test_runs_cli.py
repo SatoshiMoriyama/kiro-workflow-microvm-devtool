@@ -17,6 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from runs_cli import loader  # noqa: E402
+from runs_cli import cmd_stats  # noqa: E402
 
 
 def _write_json(path: str, obj) -> None:
@@ -183,6 +184,7 @@ import io  # noqa: E402
 from contextlib import redirect_stdout, redirect_stderr  # noqa: E402
 
 from runs_cli import cmd_list  # noqa: E402
+from runs_cli import cmd_stats  # noqa: E402
 
 
 class _Args:
@@ -466,6 +468,121 @@ class TestCmdShow(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("branch: kiro/x", out)
         self.assertIn("pushedCommit: deadbeef", out)
+
+
+class TestCmdStats(unittest.TestCase):
+    """cmd_stats.run の集計・整形・JSON 出力を検証する(別クラス)。"""
+
+    def _run(self, request_id, ok=None, broken=False, started=None, finished=None):
+        """テスト用に Run を直接組む小ヘルパ。"""
+        return loader.Run(
+            request_id=request_id,
+            ok=ok,
+            exit_code=None,
+            timed_out=None,
+            artifacts=[],
+            skipped_artifacts=[],
+            failed_uploads=[],
+            started_at=started,
+            finished_at=finished,
+            prompt=None,
+            branch=None,
+            pushed_commit=None,
+            summary=None,
+            path="/tmp/" + request_id,
+            broken=broken,
+        )
+
+    def _make_runs(self):
+        # 構成:
+        # - ok=True, duration 10 秒
+        # - ok=True, duration 20 秒
+        # - ok=False(失敗), duration 算出不可
+        # - broken=True(壊れ), duration 算出不可
+        # 合計 4 run / 成功 2 / 失敗 1 / 壊れ 1。
+        # 成功率の分母は全 run = 4 -> 2/4 = 50.0%。
+        # 平均実行時間は算出可の 2 run のみ -> (10+20)/2 = 15.0 秒。
+        return [
+            self._run(
+                "req-ok-1",
+                ok=True,
+                started="2026-11-04T20:00:00+00:00",
+                finished="2026-11-04T20:00:10+00:00",
+            ),
+            self._run(
+                "req-ok-2",
+                ok=True,
+                started="2026-11-04T20:00:00+00:00",
+                finished="2026-11-04T20:00:20+00:00",
+            ),
+            self._run("req-fail-1", ok=False),
+            self._run("req-broken-1", ok=None, broken=True),
+        ]
+
+    class _Args:
+        def __init__(self, json=False):
+            self.json = json
+
+    def _capture(self, runs, args):
+        import io
+        import contextlib
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cmd_stats.run(runs, args)
+        return rc, buf.getvalue()
+
+    def test_counts_and_rate_and_avg_json(self):
+        runs = self._make_runs()
+        rc, out = self._capture(runs, self._Args(json=True))
+        self.assertEqual(rc, 0)
+
+        data = json.loads(out)
+        self.assertEqual(data["total"], 4)
+        self.assertEqual(data["ok"], 2)
+        self.assertEqual(data["failed"], 1)
+        self.assertEqual(data["broken"], 1)
+        # 分母は全 run(4): 2/4 = 50.0%。
+        self.assertEqual(data["successRate"], 50.0)
+        # 算出可の 2 run のみで平均: (10+20)/2 = 15.0 秒。
+        self.assertEqual(data["avgDurationSeconds"], 15.0)
+
+    def test_json_expected_keys(self):
+        runs = self._make_runs()
+        _, out = self._capture(runs, self._Args(json=True))
+        data = json.loads(out)
+        self.assertEqual(
+            set(data.keys()),
+            {"total", "ok", "failed", "broken", "successRate", "avgDurationSeconds"},
+        )
+
+    def test_empty_runs_none_values(self):
+        rc, out = self._capture([], self._Args(json=True))
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        self.assertEqual(data["total"], 0)
+        self.assertEqual(data["ok"], 0)
+        self.assertEqual(data["failed"], 0)
+        self.assertEqual(data["broken"], 0)
+        # 総数 0 のとき成功率・平均は None 相当。
+        self.assertIsNone(data["successRate"])
+        self.assertIsNone(data["avgDurationSeconds"])
+
+    def test_human_output_contains_values(self):
+        runs = self._make_runs()
+        rc, out = self._capture(runs, self._Args(json=False))
+        self.assertEqual(rc, 0)
+        # 人間向け表示に主要な数値ラベルが含まれる。
+        self.assertIn("総 run 数", out)
+        self.assertIn("4", out)
+        self.assertIn("50.0%", out)
+        self.assertIn("15.0", out)
+
+    def test_human_output_na_when_empty(self):
+        rc, out = self._capture([], self._Args(json=False))
+        self.assertEqual(rc, 0)
+        # 0 件のとき成功率・平均は N/A 表示。
+        self.assertIn("N/A", out)
 
 
 if __name__ == "__main__":
