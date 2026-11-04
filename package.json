@@ -8,7 +8,12 @@
     "synth": "pnpm --filter infra synth",
     "deploy": "bash scripts/deploy.sh",
     "run-microvm": "bash scripts/run.sh",
-    "package-image": "bash scripts/package-image.sh"
+    "package-image": "bash scripts/package-image.sh",
+    "runs": "PYTHONPATH=packages/runs-cli python3 -m runs_cli",
+    "runs:list": "PYTHONPATH=packages/runs-cli python3 -m runs_cli list",
+    "runs:show": "PYTHONPATH=packages/runs-cli python3 -m runs_cli show",
+    "runs:stats": "PYTHONPATH=packages/runs-cli python3 -m runs_cli stats",
+    "runs:test": "cd packages/runs-cli && python3 -m unittest test_runs_cli"
   },
   "packageManager": "pnpm@12.10.1",
   "engines": {
