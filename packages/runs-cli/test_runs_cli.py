@@ -47,7 +47,7 @@ class TestLoader(unittest.TestCase):
             "artifacts": ["a.txt", "b.txt"],
             "skippedArtifacts": ["big.bin"],
             "failedUploads": [],
-            "stdoutKey": "runs/req-1/stdout.txt",
+            "stdoutKey": "req-1/runs/stdout.txt",
             "startedAt": "2026-11-04T20:00:00+00:00",
             "finishedAt": "2026-11-04T20:00:42+00:00",
             "ok": True,

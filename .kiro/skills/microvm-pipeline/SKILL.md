@@ -94,6 +94,7 @@ workflowPrompt に必ず含める事項:
 - 指摘対応は常に新規ブランチで MicroVM。maxIterations 3。APPROVED でない周は pause してユーザー判断を仰ぐ。確定仕様と矛盾する指摘は rejected 理由を付けて残す。
 - 並列タスク同士はファイル重複ゼロで分割し競合を避ける。重複する共通部分は先行タスクへ寄せる。同時並列は最大 3、超過はキューイング。
 - 成果物の地の文は日本語。コード識別子・パス・コマンド・ブランチ名・JSON のキー/値は原文のまま。コミットは Conventional Commits 一行。
+- 各 MicroVM 実行ステップの PROMPT(分割後の各タスク指示)は run-microvm 経由で **S3** から渡るため、長い日本語のままでよい(手動の圧縮・英訳は不要)。split ステップが分割した各タスク PROMPT を日本語で詳細に書いてよく、payload の 4096 バイト制限を意識して切り詰める必要はない(run.sh が PROMPT を `<requestId>/inputs/prompt.md` へ逃がし、payload サイズを事前検証する)。
 
 ### 3. 分割の指針(split ステップへ渡す判断基準)
 

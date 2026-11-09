@@ -52,6 +52,17 @@ export class BaseStack extends cdk.Stack {
       enforceSSL: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
+      // 入力プロンプト(<requestId>/inputs/prompt.md)は kind=input タグを付けて
+      // PUT される想定。入力は一過性なので、タグ付きオブジェクトのみ 7 日で
+      // 自動失効させる(成果物 <requestId>/runs/ は対象外)。
+      lifecycleRules: [
+        {
+          id: "expire-input-prompts",
+          enabled: true,
+          tagFilters: { kind: "input" },
+          expiration: cdk.Duration.days(7),
+        },
+      ],
     });
 
     this.logGroup = new logs.LogGroup(this, "MicrovmLogGroup", {
@@ -89,7 +100,26 @@ export class BaseStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
       description: "MicroVM execution role: PutObject to result, read API key secret",
     });
-    this.resultBucket.grantPut(this.executionRole);
+    // result バケットへのアクセスは最小権限で明示的に絞る:
+    //  - 入力プロンプトの取得は <bucket>/*/inputs/* のみ (s3:GetObject)
+    //  - 成果物の書き込みは <bucket>/*/runs/*  のみ (s3:PutObject)
+    // grantPut による広い許可は使わない。
+    this.executionRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "ReadInputPromptsOnly",
+        effect: iam.Effect.ALLOW,
+        actions: ["s3:GetObject"],
+        resources: [`${this.resultBucket.bucketArn}/*/inputs/*`],
+      }),
+    );
+    this.executionRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "WriteRunOutputsOnly",
+        effect: iam.Effect.ALLOW,
+        actions: ["s3:PutObject"],
+        resources: [`${this.resultBucket.bucketArn}/*/runs/*`],
+      }),
+    );
     this.logGroup.grantWrite(this.executionRole);
     // ゲストが短命 credential で KIRO_API_KEY を取得できるようにする。
     this.apiKeySecret.grantRead(this.executionRole);
