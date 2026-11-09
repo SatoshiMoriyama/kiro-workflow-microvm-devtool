@@ -14,7 +14,10 @@ Lambda MicroVM のライフサイクルフックを HTTP で受ける常駐プ�
     裏で走り、完了時に status.json を S3 に put する。ホスト(run.sh)は status.json の
     出現をポーリングして完了を検知する。
 
-成果物は環境変数 RESULT_BUCKET のバケットの prefix(runs/<requestId>/)配下に置く。
+成果物は環境変数 RESULT_BUCKET のバケットの prefix(<requestId>/runs/)配下に置く。
+入力プロンプトは同じバケットの <requestId>/inputs/prompt.md(UTF-8)から取得する
+(payload の promptKey 指定時)。payload に直接 prompt がある場合は後方互換で従来どおり
+それを使う。
 KIRO_API_KEY の値は CloudWatch Logs・S3 成果物・status.json・レスポンスに一切出さない。
 成果物の内容だけでなくファイル名も検査し、キーを含む名前は S3 key・status・ログ・
 応答のいずれにも出さず固定の安全表記に置換する。
@@ -297,11 +300,56 @@ def parse_run_payload(outer_raw):
 
 
 def resolve_prompt(payload):
-    """payload["prompt"] を取り出し、未指定/空/非文字列ならデフォルトへ。"""
+    """payload["prompt"] を取り出し、未指定/空/非文字列ならデフォルトへ。
+
+    promptKey(S3 からの取得)は呼び出し側(run_kiro_and_upload)で優先して扱い、
+    取得できなかった場合のフォールバックとしてこの関数(payload['prompt'] →
+    DEFAULT_PROMPT)に委ねる。この関数自体は S3 を参照しない純関数のまま保つ。
+    """
     value = payload.get("prompt") if isinstance(payload, dict) else None
     if isinstance(value, str) and value.strip():
         return value
     return DEFAULT_PROMPT
+
+
+# promptKey として許可する前提:
+#   - 非空の文字列
+#   - '<requestId>/inputs/' で始まる(入力領域に限定)
+#   - パストラバーサル '..' を含まない
+#   - 先頭 '/'(絶対パス化)を含まない
+# fail-closed: いずれかに反したら取得せず拒否し、status に理由を残す。
+def resolve_prompt_key(payload):
+    """payload["promptKey"] を取り出す。未指定/空/非文字列なら None。
+
+    値の妥当性(接頭辞・トラバーサル)は is_valid_prompt_key で別途判定する。
+    ここでは「指定の有無」を返すだけ(未指定=従来モードへの素直なフォールバック)。
+    """
+    value = payload.get("promptKey") if isinstance(payload, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def is_valid_prompt_key(prompt_key, request_id):
+    """promptKey が安全な入力キー形式か判定する(fail-closed)。
+
+    許可条件(すべて満たすこと):
+      - 文字列かつ非空
+      - 先頭が '/' でない(絶対パス化の拒否)
+      - '..' を含まない(パストラバーサルの拒否)
+      - '<request_id>/inputs/' で始まる(入力領域に限定)
+    request_id が空のときは接頭辞を確定できないため False(安全側)。
+    """
+    if not isinstance(prompt_key, str) or not prompt_key:
+        return False
+    if prompt_key.startswith("/"):
+        return False
+    if ".." in prompt_key:
+        return False
+    if not request_id:
+        return False
+    expected_prefix = f"{request_id}/inputs/"
+    return prompt_key.startswith(expected_prefix)
 
 
 # repoUrl として許可する形式: https://github.com/ 直下のパスのみ。userinfo
@@ -619,6 +667,31 @@ def _s3_put_bytes(bucket, key, data):
     return True, s3_uri
 
 
+def _s3_get_bytes(bucket, key):
+    """S3 のオブジェクト本文を標準出力経由で取得する。成否とデータ/エラーを返す。
+
+    _s3_put_bytes と対になる aws s3 cli スタイル(`aws s3 cp <uri> -`)。
+    戻り値: (True, data_bytes) もしくは (False, error_str)。
+    取得失敗(オブジェクト不在・権限・起動失敗)は明確なエラー文字列で返し、
+    呼び出し側が status.json に記録して fail-closed にできるようにする。
+    """
+    s3_uri = f"s3://{bucket}/{key}"
+    try:
+        proc = subprocess.run(
+            ["aws", "s3", "cp", s3_uri, "-"],
+            capture_output=True,
+            timeout=60,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"aws s3 cp(get) failed to launch: {exc}"
+    if proc.returncode != 0:
+        return False, (
+            f"aws s3 cp(get) exited {proc.returncode}: "
+            f"{proc.stderr.decode('utf-8', 'replace')}"
+        )
+    return True, proc.stdout or b""
+
+
 def _s3_put_file(bucket, key, path):
     """ローカルファイルを S3 に put する。成否とエラー文字列を返す。"""
     s3_uri = f"s3://{bucket}/{key}"
@@ -640,7 +713,7 @@ def _s3_put_file(bucket, key, path):
 
 def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
                         base_branch=DEFAULT_BASE_BRANCH,
-                        repo_url_rejected=False):
+                        repo_url_rejected=False, prompt_key=None):
     """Kiro CLI を同期実行し、stdout・成果物・status.json を S3 に put する。
 
     戻り値: (ok, status_dict)。ok は
@@ -648,6 +721,16 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
      and status.json 自体の put 成功)。設計 §5 どおり S3 put 非ゼロは致命。
     失敗時も status.json は必ず put を試みる。KIRO_API_KEY の値も GitHub PAT も
     ログ・返り値・status・成果物に一切出さない。
+
+    prompt_key が指定されたとき(GitHub issue #3 対応):
+      - prompt_key は '<request_id>/inputs/' で始まり、'..' も先頭 '/' も含まない
+        ことを要求する(fail-closed)。満たさなければ Kiro を実行せず
+        failedUploads に 'promptKey-rejected' を記録し ok=false で返す。
+      - 妥当なら RESULT_BUCKET の prompt_key を _s3_get_bytes で取得し、UTF-8
+        デコードして prompt とする。取得失敗は failedUploads に
+        'promptKey-fetch' を記録し ok=false で返す(黙って縮退させない)。
+      - prompt_key 未指定時は従来どおり引数 prompt(= payload['prompt'] →
+        DEFAULT_PROMPT)を使う。
 
     repo_url が指定されたとき(GitHub フロー):
       - GIT_ASKPASS helper を専用 HOME に設置し、Kiro 子プロセス env に git 認証を
@@ -727,6 +810,30 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
             secret_values, None, False, [], [], ["repoUrl-rejected"]
         )
         return False, status
+
+    # ①'' promptKey 指定時は S3 から本文を取得して prompt とする(GitHub issue #3)。
+    # runHookPayload は 4096 バイト上限で、日本語プロンプトは JSON 中で約 3 倍に膨らむ。
+    # そこで prompt 本文は <requestId>/inputs/prompt.md に置き、ここで取得する。
+    # 形式不正(接頭辞違反・'..'・先頭 '/')は fail-closed で拒否し status に記録する。
+    # 取得失敗(不在・権限等)も黙って縮退させず failedUploads に記録して ok=false。
+    # prompt_key 未指定なら引数 prompt(payload['prompt'] → DEFAULT_PROMPT)をそのまま使う。
+    if prompt_key is not None:
+        if not is_valid_prompt_key(prompt_key, request_id):
+            log("promptKey rejected: must start with '<requestId>/inputs/' and "
+                "contain no '..' or leading '/'")
+            status, _ = finalize(
+                secret_values, None, False, [], [], ["promptKey-rejected"]
+            )
+            return False, status
+        got_ok, got = _s3_get_bytes(bucket, prompt_key)
+        if not got_ok:
+            # got はエラー文字列。念のためマスクを通す(キー値は含まれない想定)。
+            log(f"promptKey fetch failed: {mask_secrets(got, secret_values)}")
+            status, _ = finalize(
+                secret_values, None, False, [], [], ["promptKey-fetch"]
+            )
+            return False, status
+        prompt = got.decode("utf-8", "replace")
 
     # ② GitHub フロー時は PAT 用 Secret ARN と専用 HOME を用意する(実値は helper 経由)。
     github_token_arn = os.environ.get("GITHUB_TOKEN_SECRET_ARN", "").strip()
@@ -939,6 +1046,7 @@ class HookHandler(BaseHTTPRequestHandler):
             request_id = str(payload.get("requestId", "")).strip()
             prefix = str(payload.get("prefix", "")).strip()
             prompt = resolve_prompt(payload)
+            prompt_key = resolve_prompt_key(payload)
             repo_url = resolve_repo_url(payload)
             # repoUrl 指定ありで resolve_repo_url が拒否(不正形式)したら fail-closed。
             # 「未指定で従来モード」と「指定ありだが不正」を区別して誤認を防ぐ。
@@ -946,13 +1054,14 @@ class HookHandler(BaseHTTPRequestHandler):
             base_branch = resolve_base_branch(payload)
             # prefix 未指定なら microvmId でフォールバックし末尾スラッシュ正規化。
             if not prefix and microvm_id:
-                prefix = f"runs/{microvm_id}/"
+                prefix = f"{microvm_id}/runs/"
             if prefix and not prefix.endswith("/"):
                 prefix += "/"
             # repoUrl は PAT を含まないがマスクを通して一貫させる。
             log(
                 f"run hook -> microvmId={microvm_id!r} "
                 f"prefix={prefix!r} requestId={request_id!r} "
+                f"promptKey={prompt_key!r} "
                 f"repoUrl={mask_secret(repo_url, None)!r} baseBranch={base_branch!r}"
             )
             # 非同期モデル: /run の RunTimeoutInSeconds は上限 60 秒のため Kiro を
@@ -975,7 +1084,8 @@ class HookHandler(BaseHTTPRequestHandler):
             def _background(prefix=prefix, request_id=request_id,
                             microvm_id=microvm_id, prompt=prompt,
                             repo_url=repo_url, base_branch=base_branch,
-                            repo_url_rejected=repo_url_rejected):
+                            repo_url_rejected=repo_url_rejected,
+                            prompt_key=prompt_key):
                 # バックグラウンド実行の戻り(ok/status)で HTTP ステータスは決めない。
                 # 成否は run_kiro_and_upload が status.json に書く。例外は握りつぶさず
                 # ログに出す(キー値は env にしか無いが念のためパターンマスクを通す)。
@@ -984,6 +1094,7 @@ class HookHandler(BaseHTTPRequestHandler):
                         prefix, request_id or microvm_id, prompt,
                         repo_url=repo_url, base_branch=base_branch,
                         repo_url_rejected=repo_url_rejected,
+                        prompt_key=prompt_key,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log(f"run hook background -> ERROR {mask_secret(str(exc), None)}")

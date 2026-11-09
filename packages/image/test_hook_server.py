@@ -67,7 +67,7 @@ class TestBuildStatus(unittest.TestCase):
             artifacts=artifacts or [],
             skipped=[],
             failed_uploads=failed_uploads or [],
-            stdout_key="runs/req-1/kiro-stdout.txt",
+            stdout_key="req-1/runs/kiro-stdout.txt",
             started_at="s",
             finished_at="f",
         )
@@ -241,7 +241,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
                 (True, "s3://status"),  # status.json
             ]
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/", self._req, "p"
+                f"{self._req}/runs/", self._req, "p"
             )
         self.assertFalse(ok)
         self.assertFalse(status["ok"])
@@ -254,7 +254,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
             hs, "_s3_put_file", return_value=(False, "aws s3 cp exited 1")
         ):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/", self._req, "p"
+                f"{self._req}/runs/", self._req, "p"
             )
         self.assertFalse(ok)
         self.assertFalse(status["ok"])
@@ -271,7 +271,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
                 (False, "aws s3 cp exited 1"),  # status.json
             ]
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/", self._req, "p"
+                f"{self._req}/runs/", self._req, "p"
             )
         # status["ok"] は put 内容上 true だが、status.json 自体を残せないので ok=false。
         self.assertFalse(ok)
@@ -283,7 +283,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
             hs, "_s3_put_file", return_value=(True, "s3://ok")
         ):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/", self._req, "p"
+                f"{self._req}/runs/", self._req, "p"
             )
         self.assertTrue(ok)
         self.assertTrue(status["ok"])
@@ -300,7 +300,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
             hs, "_s3_put_bytes", return_value=(True, "s3://ok")
         ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/", self._req, "p"
+                f"{self._req}/runs/", self._req, "p"
             )
         # 危険名は put されない(呼ばれた key に元名が出ない)。
         for call in put_file.call_args_list:
@@ -326,7 +326,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
             hs, "_s3_put_bytes", return_value=(True, "s3://ok")
         ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/", self._req, "p"
+                f"{self._req}/runs/", self._req, "p"
             )
         # 危険な成果物は put されない(その key が cp 呼び出しに現れない)。
         for call in put_file.call_args_list:
@@ -533,7 +533,7 @@ class TestRunKiroGithubFlow(unittest.TestCase):
             hs, "_s3_put_bytes", return_value=(True, "s3://ok")
         ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業内容",
                 repo_url="https://github.com/a/b.git",
@@ -579,7 +579,7 @@ class TestRunKiroGithubFlow(unittest.TestCase):
             hs, "_s3_put_bytes", return_value=(True, "s3://ok")
         ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業内容",
                 repo_url="https://github.com/a/b.git",
@@ -599,7 +599,7 @@ class TestRunKiroGithubFlow(unittest.TestCase):
             hs, "_s3_put_bytes", return_value=(True, "s3://ok")
         ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業内容",
                 repo_url="https://github.com/a/b.git",
@@ -626,7 +626,7 @@ class TestRunKiroGithubFlow(unittest.TestCase):
             hs, "_s3_put_file", return_value=(True, "s3://ok")
         ):
             hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業内容",
                 repo_url="https://github.com/a/b.git",
@@ -786,7 +786,7 @@ class TestGithubTokenFetchFailClosed(unittest.TestCase):
             hs, "_s3_put_file", return_value=(True, "s3://ok")
         ):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業",
                 repo_url="https://github.com/a/b.git",
@@ -823,7 +823,7 @@ class TestGithubTokenFetchFailClosed(unittest.TestCase):
             hs, "_s3_put_file", return_value=(True, "s3://ok")
         ):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/", self._req, "p"
+                f"{self._req}/runs/", self._req, "p"
             )
         self.assertTrue(ok)
         self.assertIn("weather.html", status["artifacts"])
@@ -888,7 +888,7 @@ class TestGithubFlowPatValueSkip(unittest.TestCase):
             hs, "_s3_put_bytes", return_value=(True, "s3://ok")
         ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業",
                 repo_url="https://github.com/a/b.git",
@@ -1023,7 +1023,7 @@ class TestReportRequired(unittest.TestCase):
             hs, "_s3_put_bytes", return_value=(True, "s3://ok")
         ), unittest.mock.patch.object(hs, "_s3_put_file", put_file):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業",
                 repo_url="https://github.com/a/b.git",
@@ -1064,7 +1064,7 @@ class TestReportRequired(unittest.TestCase):
             hs, "_s3_put_file", return_value=(False, "aws s3 cp exited 1")
         ):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業",
                 repo_url="https://github.com/a/b.git",
@@ -1106,7 +1106,7 @@ class TestRepoUrlRejectedFailClosed(unittest.TestCase):
             hs, "_s3_put_file", return_value=(True, "s3://ok")
         ):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業",
                 repo_url=None,
@@ -1155,7 +1155,7 @@ class TestGithubArnMissingFailClosed(unittest.TestCase):
             hs, "_s3_put_file", return_value=(True, "s3://ok")
         ):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業",
                 repo_url="https://github.com/a/b.git",
@@ -1211,7 +1211,7 @@ class TestSetupFailureStillWritesStatus(unittest.TestCase):
             hs, "_s3_put_file", return_value=(True, "s3://ok")
         ):
             ok, status = hs.run_kiro_and_upload(
-                f"runs/{self._req}/",
+                f"{self._req}/runs/",
                 self._req,
                 "作業",
                 repo_url="https://github.com/a/b.git",
@@ -1311,6 +1311,299 @@ class TestGlobalSteering(unittest.TestCase):
         self.assertNotIn(".kiro/steering/", p)
         self.assertIn("kiro/req-9", p)
         self.assertIn("report.json", p)
+
+
+class TestResolvePromptKey(unittest.TestCase):
+    """promptKey の取り出しと形式検証(fail-closed)。"""
+
+    def test_resolve_prompt_key_present(self):
+        self.assertEqual(
+            hs.resolve_prompt_key({"promptKey": " req-1/inputs/prompt.md "}),
+            "req-1/inputs/prompt.md",
+        )
+
+    def test_resolve_prompt_key_missing_none(self):
+        self.assertIsNone(hs.resolve_prompt_key({}))
+        self.assertIsNone(hs.resolve_prompt_key({"promptKey": "   "}))
+        self.assertIsNone(hs.resolve_prompt_key({"promptKey": 123}))
+        self.assertIsNone(hs.resolve_prompt_key("not a dict"))
+
+    def test_valid_prompt_key_accepts_inputs_prefix(self):
+        self.assertTrue(
+            hs.is_valid_prompt_key("req-1/inputs/prompt.md", "req-1")
+        )
+
+    def test_invalid_prompt_key_wrong_prefix(self):
+        # <requestId>/inputs/ で始まらない(runs/ 配下・別 requestId)。
+        self.assertFalse(
+            hs.is_valid_prompt_key("req-1/runs/prompt.md", "req-1")
+        )
+        self.assertFalse(
+            hs.is_valid_prompt_key("other/inputs/prompt.md", "req-1")
+        )
+
+    def test_invalid_prompt_key_traversal(self):
+        self.assertFalse(
+            hs.is_valid_prompt_key("req-1/inputs/../../etc/passwd", "req-1")
+        )
+
+    def test_invalid_prompt_key_leading_slash(self):
+        self.assertFalse(
+            hs.is_valid_prompt_key("/req-1/inputs/prompt.md", "req-1")
+        )
+
+    def test_invalid_prompt_key_empty_or_non_string(self):
+        self.assertFalse(hs.is_valid_prompt_key("", "req-1"))
+        self.assertFalse(hs.is_valid_prompt_key(None, "req-1"))
+
+    def test_invalid_prompt_key_empty_request_id(self):
+        # requestId が空だと接頭辞を確定できない -> 安全側で拒否。
+        self.assertFalse(
+            hs.is_valid_prompt_key("req-1/inputs/prompt.md", "")
+        )
+
+
+class TestS3GetBytes(unittest.TestCase):
+    """_s3_get_bytes が aws s3 cp <uri> - を使い、成否を返すこと。"""
+
+    def test_get_ok_returns_bytes(self):
+        proc = unittest.mock.Mock()
+        proc.returncode = 0
+        proc.stdout = "これはプロンプト本文です".encode("utf-8")
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", return_value=proc
+        ) as run:
+            ok, data = hs._s3_get_bytes("bkt", "req-1/inputs/prompt.md")
+        self.assertTrue(ok)
+        self.assertEqual(data.decode("utf-8"), "これはプロンプト本文です")
+        # aws s3 cp <s3uri> - の形で呼ばれる。
+        args = run.call_args.args[0]
+        self.assertEqual(args[:3], ["aws", "s3", "cp"])
+        self.assertEqual(args[3], "s3://bkt/req-1/inputs/prompt.md")
+        self.assertEqual(args[4], "-")
+
+    def test_get_nonzero_returns_error(self):
+        proc = unittest.mock.Mock()
+        proc.returncode = 1
+        proc.stdout = b""
+        proc.stderr = b"NoSuchKey"
+        with unittest.mock.patch.object(hs.subprocess, "run", return_value=proc):
+            ok, err = hs._s3_get_bytes("bkt", "req-1/inputs/prompt.md")
+        self.assertFalse(ok)
+        self.assertIn("exited 1", err)
+
+    def test_get_launch_failure_returns_error(self):
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=OSError("boom")
+        ):
+            ok, err = hs._s3_get_bytes("bkt", "req-1/inputs/prompt.md")
+        self.assertFalse(ok)
+        self.assertIn("failed to launch", err)
+
+
+class TestRunKiroPromptKey(unittest.TestCase):
+    """run_kiro_and_upload の promptKey 取得フロー(取得成功/拒否/取得失敗/後方互換)。"""
+
+    def setUp(self):
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        with open(os.path.join(self._workdir.name, "weather.html"), "w") as fh:
+            fh.write("<html>ok</html>")
+        patches = [
+            unittest.mock.patch.dict(
+                os.environ,
+                {"RESULT_BUCKET": "bkt", "KIRO_API_KEY_SECRET_ARN": "arn:secret"},
+                clear=False,
+            ),
+            unittest.mock.patch.object(
+                hs, "_fetch_secret", return_value=("ksk_live", None)
+            ),
+            unittest.mock.patch.object(
+                hs, "WORKDIR_BASE", os.path.dirname(self._workdir.name)
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self._req = os.path.basename(self._workdir.name)
+
+    def _patch_kiro_capturing_prompt(self):
+        """kiro-cli をモックし、渡された prompt 引数を記録する。"""
+        captured = {}
+
+        def _run(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "kiro-cli":
+                captured["prompt"] = cmd[-1]
+            proc = unittest.mock.Mock()
+            proc.returncode = 0
+            proc.stdout = b"done"
+            return proc
+
+        return captured, _run
+
+    def test_prompt_key_fetch_ok_used_as_prompt(self):
+        body = "S3 から取得した日本語プロンプト".encode("utf-8")
+        key = f"{self._req}/inputs/prompt.md"
+        captured, run = self._patch_kiro_capturing_prompt()
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=run
+        ), unittest.mock.patch.object(
+            hs, "_s3_get_bytes", return_value=(True, body)
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"{self._req}/runs/", self._req, "payload-prompt-ignored",
+                prompt_key=key,
+            )
+        self.assertTrue(ok)
+        # S3 本文がプロンプトとして使われ、payload 側の prompt は使われない。
+        self.assertEqual(captured["prompt"], "S3 から取得した日本語プロンプト")
+        # status.prompt にも取得本文が入る。
+        self.assertEqual(status["prompt"], "S3 から取得した日本語プロンプト")
+
+    def test_prompt_key_rejected_does_not_run_kiro(self):
+        # <requestId>/inputs/ で始まらない promptKey は fail-closed。
+        bad_key = f"{self._req}/runs/prompt.md"
+        kiro_run = unittest.mock.Mock()
+        get_bytes = unittest.mock.Mock()
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", kiro_run
+        ), unittest.mock.patch.object(
+            hs, "_s3_get_bytes", get_bytes
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"{self._req}/runs/", self._req, "p", prompt_key=bad_key,
+            )
+        self.assertFalse(ok)
+        self.assertFalse(status["ok"])
+        self.assertIn("promptKey-rejected", status["failedUploads"])
+        # 拒否なら Kiro も S3 取得も走らない。
+        self.assertFalse(kiro_run.called)
+        self.assertFalse(get_bytes.called)
+
+    def test_prompt_key_traversal_rejected(self):
+        bad_key = f"{self._req}/inputs/../../secret"
+        kiro_run = unittest.mock.Mock()
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", kiro_run
+        ), unittest.mock.patch.object(
+            hs, "_s3_get_bytes", unittest.mock.Mock()
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"{self._req}/runs/", self._req, "p", prompt_key=bad_key,
+            )
+        self.assertFalse(ok)
+        self.assertIn("promptKey-rejected", status["failedUploads"])
+        self.assertFalse(kiro_run.called)
+
+    def test_prompt_key_fetch_failure_recorded(self):
+        key = f"{self._req}/inputs/prompt.md"
+        kiro_run = unittest.mock.Mock()
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", kiro_run
+        ), unittest.mock.patch.object(
+            hs, "_s3_get_bytes",
+            return_value=(False, "aws s3 cp(get) exited 1: NoSuchKey"),
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"{self._req}/runs/", self._req, "p", prompt_key=key,
+            )
+        self.assertFalse(ok)
+        self.assertFalse(status["ok"])
+        self.assertIn("promptKey-fetch", status["failedUploads"])
+        # 取得失敗なら Kiro は走らない(fail-closed)。
+        self.assertFalse(kiro_run.called)
+
+    def test_legacy_prompt_used_when_no_prompt_key(self):
+        # promptKey 未指定なら従来どおり payload['prompt'](引数 prompt)を使う。
+        captured, run = self._patch_kiro_capturing_prompt()
+        get_bytes = unittest.mock.Mock()
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=run
+        ), unittest.mock.patch.object(
+            hs, "_s3_get_bytes", get_bytes
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(
+                f"{self._req}/runs/", self._req, "直接渡したプロンプト",
+            )
+        self.assertTrue(ok)
+        self.assertEqual(captured["prompt"], "直接渡したプロンプト")
+        # S3 取得は呼ばれない(後方互換)。
+        self.assertFalse(get_bytes.called)
+
+
+class TestRunHookPrefixFallback(unittest.TestCase):
+    """/run の prefix フォールバックが <microvmId>/runs/ になること。"""
+
+    def test_prefix_fallback_uses_microvm_runs(self):
+        import io
+
+        inner = json.dumps({"prompt": "x"})  # prefix / requestId なし
+        outer = json.dumps({"microvmId": "mvm-77", "runHookPayload": inner})
+        body = outer.encode("utf-8")
+
+        captured = {}
+
+        class _FakeHandler(hs.HookHandler):
+            def __init__(self):  # BaseHTTPRequestHandler の __init__ を回避
+                self.path = hs.RUN_PATH
+                self.headers = {"Content-Length": str(len(body))}
+                self.rfile = io.BytesIO(body)
+
+            def _respond(self, code, payload):
+                captured["code"] = code
+                captured["payload"] = payload
+
+        handler = _FakeHandler()
+        run_args = {}
+
+        def _fake_run(prefix, request_id, prompt, **kwargs):
+            run_args["prefix"] = prefix
+            run_args["request_id"] = request_id
+            return True, {}
+
+        # Thread をその場で同期実行するスタブに置き換える。
+        class _SyncThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        with unittest.mock.patch.dict(
+            os.environ, {"RESULT_BUCKET": "bkt"}, clear=False
+        ), unittest.mock.patch.object(
+            hs, "run_kiro_and_upload", side_effect=_fake_run
+        ), unittest.mock.patch.object(
+            hs.threading, "Thread", _SyncThread
+        ):
+            handler._handle()
+
+        # 200 accepted が返る。
+        self.assertEqual(captured["code"], 200)
+        # prefix 未指定・requestId 未指定なら <microvmId>/runs/ にフォールバックし、
+        # request_id も microvmId で補完される。
+        self.assertEqual(run_args["prefix"], "mvm-77/runs/")
+        self.assertEqual(run_args["request_id"], "mvm-77")
 
 
 if __name__ == "__main__":
