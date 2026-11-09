@@ -27,7 +27,7 @@ MicroVM 上で動く kiro-cli に 1 件の依頼を投げ、完了後に S3 へ�
 既定値を仮定せず、毎回確認する:
 
 - **AWS_PROFILE**(必須): 使用する AWS プロファイル名。既定値を仮定せず必ず聞く(公開前提でフォールバックを置かない方針)。これを `AWS_PROFILE=<profile>` として実行コマンドに前置する。
-- **PROMPT**(必須): MicroVM 内の kiro-cli にやらせる作業内容。
+- **PROMPT**(必須): MicroVM 内の kiro-cli にやらせる作業内容。PROMPT は run.sh が **S3 経由**で渡す(入力キー `<requestId>/inputs/prompt.md`、UTF-8)。長い日本語でもそのまま渡してよく、手動の圧縮・英訳は不要(payload 直載せではないので 4096 バイト制限に当たらない)。
 - **REPO_URL**(任意): GitHub フロー(clone→ブランチ作成→作業→commit→push→report 生成)をさせる場合の対象リポジトリ。`https://github.com/owner/repo.git` 形式のみ(`scripts/run.sh` / hook_server が `https://github.com/` 直下に限定)。
   - **空ならGitHub フローなし**で、PROMPT の作業だけ実行して成果物を S3 に出す従来モードになる。「リポジトリ作業をするか」をユーザーに確認し、する場合のみ REPO_URL を聞く。
 - **BASE_BRANCH**(任意): REPO_URL 指定時の起点ブランチ。既定 `main`。特に指定が無ければ既定でよい。
@@ -54,8 +54,9 @@ AWS_PROFILE=<profile> PROMPT="<ユーザーが指定した作業内容>" pnpm ru
 ```
 
 - BASE_BRANCH を変える場合は `BASE_BRANCH="<branch>"` を前置する。
-- `scripts/run.sh` が内部で requestId(`req-<日時>-<pid>`)を発番し、`run-microvm` で VM を起動 → `/run` フックで kiro-cli をバックグラウンド実行 → `status.json` の S3 出現をポーリング → `results/<requestId>/` へ回収 → VM を terminate する。待ち・回収・後始末は run.sh がやるので、追加の待機ループを自分で書かない。
-- run.sh の標準出力に `request=<requestId>`、`prefix=s3://<bucket>/runs/<requestId>/`、回収先 `-> results/<requestId>/` が出る。これらを控える。
+- `scripts/run.sh` が内部で requestId(`req-<日時>-<pid>`)を発番し、PROMPT を入力キー `<requestId>/inputs/prompt.md` へ put してから `--run-hook-payload` の JSON(本文ではなく `promptKey` を載せる)を組み立て、`run-microvm` で VM を起動 → `/run` フックで kiro-cli をバックグラウンド実行 → `status.json` の S3 出現をポーリング → `results/<requestId>/` へ回収 → VM を terminate する。待ち・回収・後始末は run.sh がやるので、追加の待機ループを自分で書かない。
+- run.sh は payload を VM へ渡す前に **JSON のバイトサイズを 4096 バイトと事前検証**し、超えていれば分かりやすいエラーメッセージで停止する(PROMPT は S3 経由なので通常は超えない。超える場合は `repoUrl` 等の他フィールドが過大。本文を payload に戻さない)。
+- run.sh の標準出力に `request=<requestId>`、`prefix=s3://<bucket>/<requestId>/runs/`、回収先 `-> results/<requestId>/` が出る。これらを控える。
 
 ### 3. 失敗の切り分け(素のまま伝える)
 
@@ -66,7 +67,7 @@ AWS_PROFILE=<profile> PROMPT="<ユーザーが指定した作業内容>" pnpm ru
 
 `results/<requestId>/` を回収したら、加工・判断せずに次を提示する:
 
-- **requestId** と **S3 prefix**(`s3://<bucket>/runs/<requestId>/`)、**回収先ローカルパス**(`results/<requestId>/`)。
+- **requestId** と **S3 prefix**(`s3://<bucket>/<requestId>/runs/`、入力プロンプトは `s3://<bucket>/<requestId>/inputs/prompt.md`)、**回収先ローカルパス**(`results/<requestId>/`)。
 - **回収物のファイルパス一覧**(`results/<requestId>/` 直下)。典型: `status.json` / `report.json` / `report.md` / `kiro-stdout.txt` / 成果物。各ファイルはパスだけ示す(中身は呼び出し側が必要に応じて開く)。
 - **`status.json` の中身はそのまま全文**提示する(呼び出し側が最初に見る成否判断の起点のため。これだけは中身を返す)。
 - GitHub フローなら `report.json` のパスも必ず示す(存在すれば)。
