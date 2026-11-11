@@ -12,6 +12,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import hook_server as hs  # noqa: E402
 
+_AUTHOR_ENV_KEYS = ("KIRO_GIT_AUTHOR_NAME", "KIRO_GIT_AUTHOR_EMAIL")
+_module_env_patcher = None
+
+
+def setUpModule():
+    # 手元に KIRO_GIT_AUTHOR_* が設定されていても既定値前提のテストが壊れないよう除去する。
+    global _module_env_patcher
+    _module_env_patcher = unittest.mock.patch.dict(os.environ)
+    _module_env_patcher.start()
+    for k in _AUTHOR_ENV_KEYS:
+        os.environ.pop(k, None)
+
+
+def tearDownModule():
+    _module_env_patcher.stop()
+
 
 class TestMaskSecret(unittest.TestCase):
     def test_exact_value_match(self):
@@ -1604,6 +1620,154 @@ class TestRunHookPrefixFallback(unittest.TestCase):
         # request_id も microvmId で補完される。
         self.assertEqual(run_args["prefix"], "mvm-77/runs/")
         self.assertEqual(run_args["request_id"], "mvm-77")
+
+
+_TARO_NAME = "Taro Yamada"
+_TARO_EMAIL = "12345+taro@users.noreply.github.com"
+
+
+class TestResolveGitAuthor(unittest.TestCase):
+    def test_defaults_when_unset(self):
+        self.assertEqual(
+            hs.resolve_git_author({}),
+            ("kiro-bot", "kiro-bot@users.noreply.github.com"),
+        )
+
+    def test_both_set_and_trimmed(self):
+        env = {
+            "KIRO_GIT_AUTHOR_NAME": f"  {_TARO_NAME}\t",
+            "KIRO_GIT_AUTHOR_EMAIL": f" {_TARO_EMAIL} ",
+        }
+        self.assertEqual(hs.resolve_git_author(env), (_TARO_NAME, _TARO_EMAIL))
+
+    def test_empty_and_blank_use_default(self):
+        for v in ("", "   ", "\t"):
+            env = {"KIRO_GIT_AUTHOR_NAME": v, "KIRO_GIT_AUTHOR_EMAIL": v}
+            self.assertEqual(
+                hs.resolve_git_author(env), (hs.GIT_AUTHOR_NAME, hs.GIT_AUTHOR_EMAIL)
+            )
+
+    def test_independent_resolution(self):
+        self.assertEqual(
+            hs.resolve_git_author({"KIRO_GIT_AUTHOR_NAME": _TARO_NAME}),
+            (_TARO_NAME, hs.GIT_AUTHOR_EMAIL),
+        )
+        self.assertEqual(
+            hs.resolve_git_author({"KIRO_GIT_AUTHOR_EMAIL": _TARO_EMAIL}),
+            (hs.GIT_AUTHOR_NAME, _TARO_EMAIL),
+        )
+
+    def test_invalid_name_falls_back(self):
+        for bad in ['a"b', "a$b", "a`b", "a\\b", "a<b", "a>b", "a\nb", "a\x7fb"]:
+            with unittest.mock.patch.object(hs, "log"):
+                name, email = hs.resolve_git_author(
+                    {"KIRO_GIT_AUTHOR_NAME": bad, "KIRO_GIT_AUTHOR_EMAIL": _TARO_EMAIL}
+                )
+            self.assertEqual(name, hs.GIT_AUTHOR_NAME, repr(bad))
+            self.assertEqual(email, _TARO_EMAIL)
+
+    def test_invalid_email_falls_back(self):
+        for bad in ["noatmark", "a@b@c", "a b@c.d", 'a"b@c.d', "@c.d", "a@"]:
+            with unittest.mock.patch.object(hs, "log"):
+                name, email = hs.resolve_git_author(
+                    {"KIRO_GIT_AUTHOR_NAME": _TARO_NAME, "KIRO_GIT_AUTHOR_EMAIL": bad}
+                )
+            self.assertEqual(name, _TARO_NAME)
+            self.assertEqual(email, hs.GIT_AUTHOR_EMAIL, repr(bad))
+
+    def test_warning_does_not_log_value(self):
+        bad_name = 'secret"name'
+        bad_email = "secret-email-no-at"
+        with unittest.mock.patch.object(hs, "log") as m:
+            hs.resolve_git_author(
+                {"KIRO_GIT_AUTHOR_NAME": bad_name, "KIRO_GIT_AUTHOR_EMAIL": bad_email}
+            )
+        self.assertTrue(m.called)
+        logged = " ".join(str(a) for c in m.call_args_list for a in c.args)
+        self.assertIn("KIRO_GIT_AUTHOR_NAME", logged)
+        self.assertIn("KIRO_GIT_AUTHOR_EMAIL", logged)
+        self.assertNotIn("secret", logged)
+
+    def test_uses_os_environ_by_default(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"KIRO_GIT_AUTHOR_NAME": _TARO_NAME, "KIRO_GIT_AUTHOR_EMAIL": _TARO_EMAIL},
+        ):
+            self.assertEqual(hs.resolve_git_author(), (_TARO_NAME, _TARO_EMAIL))
+
+    def test_build_git_env_uses_configured_author(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"KIRO_GIT_AUTHOR_NAME": _TARO_NAME, "KIRO_GIT_AUTHOR_EMAIL": _TARO_EMAIL},
+        ):
+            env = hs.build_git_env("/tmp/home-x")
+        self.assertEqual(env["GIT_AUTHOR_NAME"], _TARO_NAME)
+        self.assertEqual(env["GIT_AUTHOR_EMAIL"], _TARO_EMAIL)
+        self.assertEqual(env["GIT_COMMITTER_NAME"], _TARO_NAME)
+        self.assertEqual(env["GIT_COMMITTER_EMAIL"], _TARO_EMAIL)
+
+    def test_build_repo_prompt_uses_configured_author(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"KIRO_GIT_AUTHOR_NAME": _TARO_NAME, "KIRO_GIT_AUTHOR_EMAIL": _TARO_EMAIL},
+        ):
+            p = hs.build_repo_prompt("https://github.com/a/b.git", "main", "req-1", "作業")
+        self.assertIn(f'git config user.name "{_TARO_NAME}"', p)
+        self.assertIn(f'git config user.email "{_TARO_EMAIL}"', p)
+        self.assertNotIn('git config user.name "kiro-bot"', p)
+        self.assertNotIn("git config user.email \"kiro-bot@", p)
+
+    def test_askpass_username_stays_kiro_bot(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"KIRO_GIT_AUTHOR_NAME": _TARO_NAME, "KIRO_GIT_AUTHOR_EMAIL": _TARO_EMAIL},
+        ):
+            script = hs.render_askpass_script("arn:x")
+        self.assertIn("printf '%s' 'kiro-bot'", script)
+        self.assertNotIn(_TARO_NAME, script)
+
+
+class TestRunKiroGithubFlowAuthor(unittest.TestCase):
+    """GitHub フローで kiro-cli に渡る env がデプロイ時設定の author になる。"""
+
+    # 既存クラスのセットアップ/ヘルパーを流用する(継承すると既存テストが再実行されるため)。
+    setUp = TestRunKiroGithubFlow.setUp
+    _fetch_secret_side = TestRunKiroGithubFlow._fetch_secret_side
+    _fake_kiro_run = TestRunKiroGithubFlow._fake_kiro_run
+
+    def test_kiro_env_has_configured_author(self):
+        captured = {}
+        base = self._fake_kiro_run({})
+
+        def _run(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "kiro-cli":
+                captured["env"] = kwargs.get("env")
+            return base(cmd, *args, **kwargs)
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"KIRO_GIT_AUTHOR_NAME": _TARO_NAME, "KIRO_GIT_AUTHOR_EMAIL": _TARO_EMAIL},
+        ), unittest.mock.patch.object(
+            hs, "_fetch_secret", side_effect=self._fetch_secret_side
+        ), unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=_run
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", return_value=(True, "s3://ok")
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            hs.run_kiro_and_upload(
+                f"{self._req}/runs/",
+                self._req,
+                "作業内容",
+                repo_url="https://github.com/a/b.git",
+                base_branch="main",
+            )
+        env = captured["env"]
+        self.assertEqual(env["GIT_AUTHOR_NAME"], _TARO_NAME)
+        self.assertEqual(env["GIT_AUTHOR_EMAIL"], _TARO_EMAIL)
+        self.assertEqual(env["GIT_COMMITTER_NAME"], _TARO_NAME)
+        self.assertEqual(env["GIT_COMMITTER_EMAIL"], _TARO_EMAIL)
 
 
 if __name__ == "__main__":
