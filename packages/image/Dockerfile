@@ -25,6 +25,9 @@ RUN curl -fsSL "$KIRO_CLI_DL_URL" -o /tmp/kirocli.zip \
     && cd /tmp/kirocli \
     && Q_INSTALL_GLOBAL=1 Q_SKIP_SETUP=1 ./install.sh \
     && rm -rf /tmp/kirocli /tmp/kirocli.zip
+# 現行インストーラは Q_INSTALL_GLOBAL=1 でも /root/.local/bin に導入する(実機ビルドで確認)。
+# hook_server は "kiro-cli" を PATH 解決で起動するため、導入先を PATH に追加する。
+ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /app
 COPY hook_server.py /app/hook_server.py

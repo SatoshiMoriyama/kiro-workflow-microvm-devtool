@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # MicroVM を起動し、/run フックが S3 に吐いた結果を回収して終了する。
 #
+# S3 レイアウト(入力 key / 出力 prefix はいずれも <requestId> を先頭に置く):
+#   入力 : s3://$RESULT_BUCKET/<requestId>/inputs/prompt.md  (UTF-8。本スクリプトが put)
+#   出力 : s3://$RESULT_BUCKET/<requestId>/runs/             (status.json, report.json,
+#          report.md, kiro-stdout.txt, artifacts など。hook_server が put)
+# payload は prompt 本文ではなく promptKey(=<requestId>/inputs/prompt.md)を運ぶ。
+# これは GitHub issue #3(runHookPayload は最大 4096 バイト。日本語 prompt は JSON 内で
+# 約3倍に膨らむ)への対処で、prompt を S3 経由にして payload を小さく保つ。
+# 直接 payload に prompt を積む旧方式も hook_server 側は受理する(後方互換)。
+# prefix が payload に無い場合、hook_server は <microvmId>/runs/ にフォールバックする。
+#
 # 前提: cdk deploy 済み + scripts/package-image.sh でイメージビルド済み。
 # 使い方(AWS_PROFILE は必須。既定のフォールバックは無い):
 #   AWS_PROFILE=<profile> ./scripts/run.sh
@@ -48,28 +58,72 @@ IMAGE_ARN="$(aws lambda-microvms list-microvm-images \
 [[ -n "$IMAGE_ARN" && "$IMAGE_ARN" != "None" ]] || { echo "ERROR: イメージ '$IMAGE_NAME' が無い(ビルド完了か)" >&2; exit 1; }
 
 REQUEST_ID="${REQUEST_ID:-req-$(date +%Y%m%d-%H%M%S)-$$}"
-PREFIX="runs/${REQUEST_ID}/"
+PREFIX="${REQUEST_ID}/runs/"
+PROMPT_KEY="${REQUEST_ID}/inputs/prompt.md"
 INTERNET_EGRESS_ARN="arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS"
-# payload に repoUrl / baseBranch を積む。repoUrl が空なら repoUrl キー自体を省き、
-# hook_server 側は従来どおり clone なしで prompt を実行する(後方互換)。
+
+# payload に promptKey / baseBranch / prefix / requestId を積む。repoUrl が空なら
+# repoUrl キー自体を省き、hook_server 側は従来どおり clone なしで prompt を実行する。
+# ここで payload を組み立ててサイズ検証まで済ませてから prompt.md を S3 に put する。
+# こうすることで、超過時は何も put する前に exit し、不要なアップロードを残さない。
 RUN_HOOK_PAYLOAD="$(python3 -c '
 import json, sys
 payload = {
     "requestId": sys.argv[1],
     "prefix": sys.argv[2],
-    "prompt": sys.argv[3],
+    "promptKey": sys.argv[3],
     "baseBranch": sys.argv[5],
 }
 repo_url = sys.argv[4]
 if repo_url:
     payload["repoUrl"] = repo_url
 print(json.dumps(payload))
-' "$REQUEST_ID" "$PREFIX" "$PROMPT" "$REPO_URL" "$BASE_BRANCH")"
+' "$REQUEST_ID" "$PREFIX" "$PROMPT_KEY" "$REPO_URL" "$BASE_BRANCH")"
+
+# 事前バリデーション: --run-hook-payload に渡す JSON 文字列の UTF-8 バイト長を測り、
+# 4096 バイトを超える場合は VM を起動する前(かつ prompt.md を put する前)に stderr に
+# エラー(実バイト数・超過バイト数・削減ヒント)を出して exit 1 する。
+# これは GitHub issue #3 への保険。put より前に行うことで、超過時に S3 へ何も
+# アップロードされないことを保証する。
+PAYLOAD_BYTES="$(printf '%s' "$RUN_HOOK_PAYLOAD" | wc -c)"
+if (( PAYLOAD_BYTES > 4096 )); then
+  echo "ERROR: runHookPayload が 4096 バイトを超過しています(実測 ${PAYLOAD_BYTES} バイト, 超過 $(( PAYLOAD_BYTES - 4096 )) バイト)。" >&2
+  echo "       ヒント: requestId / baseBranch / repoUrl を短くするか、prompt 本文は promptKey 経由(S3)で渡しているため payload 自体に長い文字列を積まないでください。" >&2
+  exit 1
+fi
+
+# prompt 本文を UTF-8 で S3(既存の result バケット)へ put する。payload には本文では
+# なくこの key(promptKey)を積むことで、runHookPayload を 4096 バイト以内に保つ。
+# body は一時ファイル経由で渡し、put 後に削除する。tagging で入力オブジェクトを識別する。
+#
+# ここで mktemp した一時ファイルと、既に put 済みの prompt.md の後始末を trap で保証する。
+# バリデーション失敗・中断(INT/TERM)・その他のエラー終了時に、一時ファイルを削除し、
+# S3 に上がってしまった prompt.md を消す。run-microvm まで到達したら(= 正常に payload を
+# 消費する段階に入ったら)この trap は解除し、以降は VM terminate 用の trap に切り替える。
+PROMPT_TMP="$(mktemp)"
+PROMPT_PUT=""
+cleanup_prompt() {
+  rm -f "$PROMPT_TMP"
+  if [[ -n "$PROMPT_PUT" ]]; then
+    aws s3api delete-object --bucket "$RESULT_BUCKET" --key "$PROMPT_KEY" >/dev/null 2>&1 || true
+  fi
+}
+trap 'cleanup_prompt' EXIT INT TERM
+
+printf '%s' "$PROMPT" > "$PROMPT_TMP"
+aws s3api put-object \
+  --bucket "$RESULT_BUCKET" \
+  --key "$PROMPT_KEY" \
+  --body "$PROMPT_TMP" \
+  --content-type "text/markdown; charset=utf-8" \
+  --tagging "kind=input" >/dev/null
+PROMPT_PUT="1"
+rm -f "$PROMPT_TMP"
 
 if [[ -n "$REPO_URL" ]]; then
-  echo "[run] request=$REQUEST_ID prefix=s3://$RESULT_BUCKET/$PREFIX repo=$REPO_URL base=$BASE_BRANCH"
+  echo "[run] request=$REQUEST_ID prefix=s3://$RESULT_BUCKET/$PREFIX promptKey=s3://$RESULT_BUCKET/$PROMPT_KEY repo=$REPO_URL base=$BASE_BRANCH"
 else
-  echo "[run] request=$REQUEST_ID prefix=s3://$RESULT_BUCKET/$PREFIX"
+  echo "[run] request=$REQUEST_ID prefix=s3://$RESULT_BUCKET/$PREFIX promptKey=s3://$RESULT_BUCKET/$PROMPT_KEY"
 fi
 
 # 非同期モデル: /run は Kiro をバックグラウンド起動して即 200 を返す。Kiro は
@@ -86,7 +140,11 @@ MICROVM_ID="$(aws lambda-microvms run-microvm \
   --query microvmId --output text)"
 echo "[run] microvm=$MICROVM_ID"
 
-trap 'aws lambda-microvms terminate-microvm --microvm-identifier "$MICROVM_ID" >/dev/null 2>&1 || true' EXIT
+# run-microvm まで到達したので、prompt.md は VM が消費する正規の入力になった。
+# 以降は prompt.md を削除しないよう cleanup_prompt の削除対象から外し、
+# trap を VM terminate 用に切り替える(INT/TERM/EXIT いずれでも VM を terminate する)。
+PROMPT_PUT=""
+trap 'aws lambda-microvms terminate-microvm --microvm-identifier "$MICROVM_ID" >/dev/null 2>&1 || true' EXIT INT TERM
 
 # バックグラウンドの Kiro が status.json を put するのを待つ(最大 1860s = 372 x 5s)。
 # --maximum-duration(1800s)より少し長くし、VM が寿命で終わるまで待てるようにする。
