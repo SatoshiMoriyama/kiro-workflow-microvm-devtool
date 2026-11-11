@@ -19,6 +19,7 @@ MicroVM 上で動く kiro-cli に 1 件の依頼を投げ、完了後に S3 へ�
 - デプロイ済み(Base/Image スタック、MicroVM イメージ)で、Secret `kiro-microvm/kiro-api-key`、GitHub フローを使うなら `kiro-microvm/github-token` に値が入っていること。未デプロイ・未投入ならその旨をユーザーに伝えて中断する(このスキルはデプロイ・PAT 投入をしない)。
 - **AWS プロファイルは必須入力。既定のフォールバックは無い**(公開前提で環境依存のプロファイル名を決め打ちしない)。毎回ユーザーに聞く(下記ステップ 1)。`scripts/run.sh` も `AWS_PROFILE` 未指定ならエラーで止まる。
 - リージョンは `ap-northeast-1`(MicroVMs 提供リージョン)。SSO トークン切れ(`Token has expired`)なら、ユーザーに `aws sso login --profile <指定プロファイル>` を促して中断する。
+- MicroVM 内 kiro-cli のコミット author はデプロイ時設定(環境変数 `KIRO_GIT_AUTHOR_NAME` / `KIRO_GIT_AUTHOR_EMAIL` または CDK コンテキスト `gitAuthorName` / `gitAuthorEmail`。詳細は README「コミット author の設定」)で、未指定時は `kiro-bot <kiro-bot@users.noreply.github.com>`。このスキルからラン単位で変更する手段は無い(入力として聞かない)。
 
 ## 手順
 

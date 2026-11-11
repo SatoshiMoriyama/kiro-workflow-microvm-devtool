@@ -22,6 +22,7 @@ description: 1 つの依頼を「先行(共通基盤)タスク」と「並列可
 - GitHub フロー前提。REPO_URL が必須(https://github.com/owner/repo.git)。デプロイ済み・Secret(kiro-api-key / github-token)投入済み・AWS SSO 有効・gh 認証済みであること。未整備なら run-microvm skill のガードに従い中断・報告する。
 - **AWS プロファイルは必須入力。既定のフォールバックは無い**(公開前提)。ステップ 1 で毎回ユーザーに聞き、workflowPrompt に明記して各 MicroVM 実行ステップへ `AWS_PROFILE=<profile>` として渡す。
 - MicroVM の GitHub フローは「渡された base ブランチを clone → kiro/<requestId> ブランチを切って作業 → push」までで、マージはしない。base は run-microvm に BASE_BRANCH で渡す。
+- MicroVM が作る実装コミットの author はデプロイ時設定(未指定時 `kiro-bot <kiro-bot@users.noreply.github.com>`、詳細は README「コミット author の設定」)で、パイプラインやラン単位では変えない。手元側 coder ステップが作るマージコミットは手元の git 設定の author になる。両者を同じ名義にしたい場合は、デプロイ時に手元と同じ author(GitHub アカウントに紐づくメール)を設定する。
 - レビューは workflow-review.md(ユーザーのグローバル steering)に従う: Claude 中量級 + GPT 中量級の 2 系統並列 + 中量級の集約。高級モデル・高 effort は使わない。モデル ID は実行環境の生きた一覧から解決する(ハードコードしない)。
 
 ## ブランチ構造
