@@ -254,6 +254,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
             # stdout put は失敗、status.json put は成功。
             put_bytes.side_effect = [
                 (False, "aws s3 cp exited 1"),  # stdout
+                (True, "s3://events"),  # kiro-events.jsonl
                 (True, "s3://status"),  # status.json
             ]
             ok, status = hs.run_kiro_and_upload(
@@ -284,6 +285,7 @@ class TestRunKiroUploadFailures(unittest.TestCase):
         ), unittest.mock.patch.object(hs, "_s3_put_bytes") as put_bytes:
             put_bytes.side_effect = [
                 (True, "s3://stdout"),  # stdout
+                (True, "s3://events"),  # kiro-events.jsonl
                 (False, "aws s3 cp exited 1"),  # status.json
             ]
             ok, status = hs.run_kiro_and_upload(
@@ -353,6 +355,198 @@ class TestRunKiroUploadFailures(unittest.TestCase):
         self.assertNotIn("ksk_live", json.dumps(status, ensure_ascii=False))
         # clean な成果物は引き続き put される。
         self.assertIn("weather.html", status["artifacts"])
+
+
+class TestParseKiroStreamJson(unittest.TestCase):
+    @staticmethod
+    def _usage(credits):
+        return json.dumps({"type": "sessionUpdate", "data": {"sessionId": "s", "update": {
+            "sessionUpdate": "session_info_update",
+            "_meta": {"kiro": {"kind": "session_usage", "credits": credits}}}}})
+
+    @staticmethod
+    def _finished(text):
+        return json.dumps({"type": "runFinished", "data": {
+            "sessionId": "s", "status": "success", "stopReason": "end_turn",
+            "finalText": text, "finalTextTruncated": False}})
+
+    def _credit(self, usage, unit="credit"):
+        return {"usage": usage, "unit": unit, "unitPlural": unit + "s"}
+
+    def test_sample_events(self):
+        lines = [
+            '{"type":"runStarted","data":{"payloadSchema":"acp","acpProtocolVersion":1,"engine":"v3"}}',
+            json.dumps({"type": "sessionUpdate", "data": {"update": {"_meta": {"kiro": {
+                "kind": "turn_completion", "promptTurnSummaries": [{"usage": 0.01}]}}}}}),
+            self._usage([self._credit(0.06937422736318409)]),
+            self._finished("2"),
+        ]
+        self.assertEqual(hs.parse_kiro_stream_json("\n".join(lines) + "\n"),
+                         ("2", 0.06937422736318409))
+
+    def test_last_session_usage_wins(self):
+        text = "\n".join([self._usage([self._credit(0.1)]),
+                          self._usage([self._credit(0.25)]), self._finished("x")])
+        self.assertEqual(hs.parse_kiro_stream_json(text), ("x", 0.25))
+
+    def test_sums_credit_units_only(self):
+        text = self._usage([self._credit(0.1), self._credit(5, "token"), self._credit(2)])
+        self.assertEqual(hs.parse_kiro_stream_json(text), (None, 2.1))
+
+    def test_no_credit_element_is_none(self):
+        text = self._usage([self._credit(5, "token")])
+        self.assertEqual(hs.parse_kiro_stream_json(text), (None, None))
+
+    def test_bool_and_string_usage_ignored(self):
+        text = self._usage([self._credit(True), self._credit("0.5")])
+        self.assertEqual(hs.parse_kiro_stream_json(text), (None, None))
+        text = self._usage([self._credit(True), self._credit(0.5)])
+        self.assertEqual(hs.parse_kiro_stream_json(text), (None, 0.5))
+
+    def test_non_finite_usage_ignored(self):
+        text = self._usage([self._credit(float("nan")), self._credit(0.5),
+                            self._credit(float("inf")), self._credit(float("-inf"))])
+        # json.dumps は NaN/Infinity をそのまま出力し、json.loads も受理する
+        self.assertEqual(hs.parse_kiro_stream_json(text), (None, 0.5))
+        text = self._usage([self._credit(float("nan")), self._credit(float("inf"))])
+        self.assertEqual(hs.parse_kiro_stream_json(text), (None, None))
+
+    def test_credits_not_list_is_none(self):
+        self.assertEqual(hs.parse_kiro_stream_json(self._usage("x")), (None, None))
+
+    def test_invalid_lines_skipped(self):
+        text = "\n".join(["not json", "", "[1,2]", "42", "{broken",
+                          self._usage([self._credit(0.3)]), self._finished("ok")])
+        self.assertEqual(hs.parse_kiro_stream_json(text), ("ok", 0.3))
+
+    def test_empty_text_and_none(self):
+        self.assertEqual(hs.parse_kiro_stream_json(""), (None, None))
+        self.assertEqual(hs.parse_kiro_stream_json("2"), (None, None))
+        self.assertEqual(hs.parse_kiro_stream_json(None), (None, None))
+        self.assertEqual(hs.parse_kiro_stream_json(b"x"), (None, None))
+
+
+class TestCreditsUsedStatusAndArtifacts(unittest.TestCase):
+    def _status(self, **kw):
+        return hs.build_status(
+            request_id="r", prompt="p", exit_code=0, timed_out=False,
+            artifacts=[], skipped=[], failed_uploads=[], stdout_key="k",
+            started_at="s", finished_at="f", **kw)
+
+    def test_credits_default_none(self):
+        st = self._status()
+        self.assertIn("creditsUsed", st)
+        self.assertIsNone(st["creditsUsed"])
+        self.assertTrue(st["ok"])
+
+    def test_credits_value_not_rounded(self):
+        st = self._status(credits_used=0.06937422736318409)
+        self.assertEqual(st["creditsUsed"], 0.06937422736318409)
+        json.dumps(st)
+
+    def test_select_artifacts_excludes_events(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "kiro-events.jsonl"), "w").close()
+            open(os.path.join(d, "a.md"), "w").close()
+            self.assertEqual(hs.select_artifacts(d), ["a.md"])
+
+
+class TestRunKiroStreamJson(TestRunKiroUploadFailures):
+    """stream-json の stdout を解析して kiro-stdout.txt / kiro-events.jsonl / creditsUsed に反映する。"""
+
+    # 継承したテストを再実行しないよう空にする。
+    def test_stdout_put_failure_sets_ok_false(self): pass
+    def test_artifact_put_failure_sets_ok_false(self): pass
+    def test_status_put_failure_returns_not_ok(self): pass
+    def test_all_success_ok_true(self): pass
+    def test_secret_in_filename_not_uploaded_or_leaked(self): pass
+
+    def _run(self, stdout, put_results=None):
+        proc = unittest.mock.Mock()
+        proc.returncode = 0
+        proc.stdout = stdout
+        puts = {}
+
+        def put_bytes(bucket, key, data):
+            puts[key] = data
+            if put_results and key.rsplit("/", 1)[-1] in put_results:
+                return put_results[key.rsplit("/", 1)[-1]]
+            return (True, "s3://ok")
+
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", return_value=proc
+        ) as run, unittest.mock.patch.object(
+            hs, "_s3_put_bytes", side_effect=put_bytes
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(f"{self._req}/runs/", self._req, "p")
+        return ok, status, puts, run
+
+    def _stream(self, extra_text="2"):
+        return "\n".join([
+            '{"type":"runStarted","data":{}}',
+            TestParseKiroStreamJson._usage([{"usage": 0.5, "unit": "credit"}]),
+            TestParseKiroStreamJson._finished(extra_text),
+        ]).encode("utf-8")
+
+    def test_stream_json_flow(self):
+        raw = self._stream()
+        ok, status, puts, run = self._run(raw)
+        p = f"{self._req}/runs/"
+        self.assertTrue(ok)
+        self.assertEqual(puts[p + "kiro-stdout.txt"], b"2")
+        self.assertEqual(puts[p + "kiro-events.jsonl"], raw)
+        self.assertEqual(status["creditsUsed"], 0.5)
+        self.assertEqual(status["stdoutKey"], p + "kiro-stdout.txt")
+        argv = run.call_args[0][0]
+        self.assertIn("--output-format", argv)
+        self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
+
+    def test_timeout_discards_partial_credits(self):
+        raw = self._stream("partial")
+        exc = hs.subprocess.TimeoutExpired(cmd="kiro-cli", timeout=1, output=raw)
+        puts = {}
+
+        def put_bytes(bucket, key, data):
+            puts[key] = data
+            return (True, "s3://ok")
+
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=exc
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", side_effect=put_bytes
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(f"{self._req}/runs/", self._req, "p")
+        self.assertFalse(ok)
+        self.assertTrue(status["timedOut"])
+        self.assertIsNone(status["creditsUsed"])
+        # finalText の扱いは従来どおり(部分 stdout を解析して使う)
+        self.assertEqual(puts[f"{self._req}/runs/" + "kiro-stdout.txt"], b"partial")
+
+    def test_text_stdout_fallback(self):
+        ok, status, puts, _ = self._run(b"done")
+        p = f"{self._req}/runs/"
+        self.assertEqual(puts[p + "kiro-stdout.txt"], b"done")
+        self.assertEqual(puts[p + "kiro-events.jsonl"], b"done")
+        self.assertIsNone(status["creditsUsed"])
+        self.assertTrue(ok)
+
+    def test_events_put_failure(self):
+        ok, status, _, _ = self._run(
+            self._stream(), {"kiro-events.jsonl": (False, "exit 1")})
+        self.assertFalse(ok)
+        self.assertFalse(status["ok"])
+        self.assertIn("kiro-events.jsonl", status["failedUploads"])
+
+    def test_events_masked(self):
+        raw = self._stream("leak ksk_live end")
+        _, _, puts, _ = self._run(raw)
+        p = f"{self._req}/runs/"
+        self.assertNotIn(b"ksk_live", puts[p + "kiro-events.jsonl"])
+        self.assertNotIn(b"ksk_live", puts[p + "kiro-stdout.txt"])
 
 
 class TestMaskGithubToken(unittest.TestCase):

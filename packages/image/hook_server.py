@@ -8,8 +8,8 @@ Lambda MicroVM のライフサイクルフックを HTTP で受ける常駐プ�
 - GET/POST /aws/lambda-microvms/runtime/v1/run
     run-microvm 後に 1 回呼ばれる。/run の RunTimeoutInSeconds は上限 60 秒のため、
     Kiro をここで同期実行はできない。Secrets Manager からのキー取得 →
-    `kiro-cli chat --trust-all-tools --no-interactive "<prompt>"` 実行 →
-    生成ファイル・stdout・status.json の S3 put 一式をバックグラウンドスレッドで
+    `kiro-cli chat --trust-all-tools --no-interactive --output-format stream-json "<prompt>"`
+    実行 → 生成ファイル・stdout(最終応答テキストと生イベント列)・status.json の S3 put 一式をバックグラウンドスレッドで
     起動し、即 200({"status":"accepted"})を返す。Kiro は MicroVM が生きている限り
     裏で走り、完了時に status.json を S3 に put する。ホスト(run.sh)は status.json の
     出現をポーリングして完了を検知する。
@@ -25,6 +25,7 @@ KIRO_API_KEY の値は CloudWatch Logs・S3 成果物・status.json・レスポ�
 
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -73,7 +74,7 @@ except ValueError:
     KIRO_TIMEOUT_SECONDS = 1200
 
 # 成果物として put しない予約名。
-RESERVED_NAMES = {"kiro-stdout.txt", "status.json"}
+RESERVED_NAMES = {"kiro-stdout.txt", "status.json", "kiro-events.jsonl"}
 
 # MicroVM 内 kiro-cli 向けグローバル steering の焼き込み先(= KIRO_HOME/steering)。
 # Dockerfile で packages/image/steering/*.md をここへ COPY し、ENV KIRO_HOME=/root/.kiro
@@ -151,7 +152,7 @@ def mask_secret(text, api_key):
 def select_artifacts(workdir):
     """workdir 直下(非再帰)の通常ファイル名のみを昇順で返す。
 
-    除外: "." 始まりの隠しファイル、ディレクトリ、予約名(kiro-stdout.txt / status.json)。
+    除外: "." 始まりの隠しファイル、ディレクトリ、予約名(kiro-stdout.txt / status.json / kiro-events.jsonl)。
     戻りは basename の昇順リスト。
     """
     result = []
@@ -252,6 +253,7 @@ def build_status(
     stdout_key,
     started_at,
     finished_at,
+    credits_used=None,
 ):
     """status.json の辞書を組み立てる。
 
@@ -259,6 +261,8 @@ def build_status(
     exit_code は None 許容。S3 put 失敗(stdout/成果物)があれば ok=false
     (設計 §5: put 非ゼロは致命)。キー名は設計 §3 status.json スキーマの原文どおり。
     failedUploads は put に失敗した対象名(stdout / 成果物名)。キー値は含めない。
+    creditsUsed は最後の session_usage イベントの credit 合計(丸めなし)。
+    取得不可は None。ok の判定には影響しない。
     """
     ok = (exit_code == 0) and (not timed_out) and (not failed_uploads)
     return {
@@ -272,8 +276,69 @@ def build_status(
         "stdoutKey": stdout_key,
         "startedAt": started_at,
         "finishedAt": finished_at,
+        "creditsUsed": credits_used,
         "ok": ok,
     }
+
+
+def parse_kiro_stream_json(text):
+    """kiro-cli の stream-json 出力(JSON Lines)を解析する。純関数。
+
+    戻り値: (final_text, credits_used)。
+    - final_text: 最後の runFinished イベントの data.finalText(str)。無ければ None。
+    - credits_used: 最後の session_usage イベントの credits のうち、unit が "credit" で
+      usage が有限の int/float(bool・NaN・Infinity 除外)の要素の usage 合計(float、丸めなし)。無ければ None。
+    不正な行・想定外の形式は読み飛ばし、例外は外に出さず見つからなければ None。
+    """
+    final_text = None
+    credits_used = None
+    try:
+        if not isinstance(text, str):
+            return None, None
+        last_usage = None  # 最後の session_usage の credits(未判定は None)
+        found_usage = False
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            if event.get("type") == "runFinished":
+                ft = data.get("finalText")
+                final_text = ft if isinstance(ft, str) else None
+            update = data.get("update")
+            if not isinstance(update, dict):
+                continue
+            meta = update.get("_meta")
+            kiro = meta.get("kiro") if isinstance(meta, dict) else None
+            if isinstance(kiro, dict) and kiro.get("kind") == "session_usage":
+                found_usage = True
+                last_usage = kiro.get("credits")
+        if found_usage and isinstance(last_usage, list):
+            total = 0.0
+            matched = False
+            for item in last_usage:
+                if not isinstance(item, dict) or item.get("unit") != "credit":
+                    continue
+                usage = item.get("usage")
+                if isinstance(usage, bool) or not isinstance(usage, (int, float)):
+                    continue
+                if not math.isfinite(usage):
+                    continue
+                total += float(usage)
+                matched = True
+            if matched:
+                credits_used = total
+    except Exception:  # noqa: BLE001
+        return None, None
+    return final_text, credits_used
 
 
 def parse_run_payload(outer_raw):
@@ -754,7 +819,7 @@ def _s3_put_file(bucket, key, path):
 def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
                         base_branch=DEFAULT_BASE_BRANCH,
                         repo_url_rejected=False, prompt_key=None):
-    """Kiro CLI を同期実行し、stdout・成果物・status.json を S3 に put する。
+    """Kiro CLI(--output-format stream-json)を同期実行し、stdout・イベント列・成果物・status.json を S3 に put する。
 
     戻り値: (ok, status_dict)。ok は
     (exitCode==0 and not timedOut and stdout・成果物の put 失敗なし
@@ -794,7 +859,8 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
     stdout_key = f"{prefix}kiro-stdout.txt"
     status_key = f"{prefix}status.json"
 
-    def finalize(secret_values, exit_code, timed_out, artifacts, skipped, failed_uploads):
+    def finalize(secret_values, exit_code, timed_out, artifacts, skipped, failed_uploads,
+                 credits_used=None):
         """status.json を組み立てて put する。
 
         戻り値: (status_dict, status_put_ok)。status.json 自体の put 失敗は
@@ -814,6 +880,7 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
             stdout_key=stdout_key,
             started_at=started_at,
             finished_at=finished_at,
+            credits_used=credits_used,
         )
         body = json.dumps(status, ensure_ascii=False, indent=2)
         body = mask_secrets(body, secret_values)
@@ -944,6 +1011,8 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
                     "chat",
                     "--trust-all-tools",
                     "--no-interactive",
+                    "--output-format",
+                    "stream-json",
                     run_prompt,
                 ],
                 cwd=workdir,
@@ -972,13 +1041,28 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
 
     # ⑤ stdout をマスクして put
     stdout_text = stdout_bytes.decode("utf-8", "replace")
-    stdout_masked = mask_secrets(stdout_text, secret_values)
+    final_text, credits_used = parse_kiro_stream_json(stdout_text)
+    if timed_out:
+        # タイムアウト時の session_usage は途中値なので creditsUsed は null とする。
+        credits_used = None
+    # final_text が取れなければ(旧形式・解析不能・タイムアウト等)従来どおり全文。
+    stdout_body = final_text if final_text is not None else stdout_text
+    stdout_masked = mask_secrets(stdout_body, secret_values)
     put_ok, detail = _s3_put_bytes(
         bucket, stdout_key, stdout_masked.encode("utf-8")
     )
     if not put_ok:
         log(f"stdout put failed: {mask_secrets(detail, secret_values)}")
         failed_uploads.append("kiro-stdout.txt")
+
+    # ⑤' 生のイベント列(JSON Lines)もマスクして put
+    events_masked = mask_secrets(stdout_text, secret_values)
+    put_ok, detail = _s3_put_bytes(
+        bucket, f"{prefix}kiro-events.jsonl", events_masked.encode("utf-8")
+    )
+    if not put_ok:
+        log(f"kiro-events.jsonl put failed: {mask_secrets(detail, secret_values)}")
+        failed_uploads.append("kiro-events.jsonl")
 
     # ⑥ 成果物を選別し、キー混入チェックに合格したものだけ put
     artifacts = []
@@ -1048,7 +1132,8 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
 
     # ⑦ status.json を生成・put
     status, status_put_ok = finalize(
-        secret_values, exit_code, timed_out, artifacts, skipped, failed_uploads
+        secret_values, exit_code, timed_out, artifacts, skipped, failed_uploads,
+        credits_used=credits_used,
     )
     # status.json 自体の put に失敗したら status を残せないため必ず /run 500。
     ok = status["ok"] and status_put_ok
