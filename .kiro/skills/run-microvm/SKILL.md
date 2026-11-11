@@ -68,8 +68,9 @@ AWS_PROFILE=<profile> PROMPT="<ユーザーが指定した作業内容>" pnpm ru
 `results/<requestId>/` を回収したら、加工・判断せずに次を提示する:
 
 - **requestId** と **S3 prefix**(`s3://<bucket>/<requestId>/runs/`、入力プロンプトは `s3://<bucket>/<requestId>/inputs/prompt.md`)、**回収先ローカルパス**(`results/<requestId>/`)。
-- **回収物のファイルパス一覧**(`results/<requestId>/` 直下)。典型: `status.json` / `report.json` / `report.md` / `kiro-stdout.txt` / 成果物。各ファイルはパスだけ示す(中身は呼び出し側が必要に応じて開く)。
+- **回収物のファイルパス一覧**(`results/<requestId>/` 直下)。典型: `status.json` / `report.json` / `report.md` / `kiro-stdout.txt`(kiro-cli の最終応答テキスト)/ `kiro-events.jsonl`(kiro-cli の stream-json イベント列、JSON Lines)/ 成果物。各ファイルはパスだけ示す(中身は呼び出し側が必要に応じて開く)。
 - **`status.json` の中身はそのまま全文**提示する(呼び出し側が最初に見る成否判断の起点のため。これだけは中身を返す)。
+- `status.json` には `creditsUsed`(number | null、kiro-cli の使用クレジット)が含まれうる(古いランや旧イメージのランではキー自体が無い)。status.json は従来どおり全文そのまま提示すればよく、このスキルは `creditsUsed` の合算・解釈をしない(合算は呼び出し側の責務)。
 - GitHub フローなら `report.json` のパスも必ず示す(存在すれば)。
 
 **加えない**こと: 成否の解釈(「成功しました」等の断定)、PAT 漏洩チェック、リトライ提案、push 後の後続処理。結果の事実(パスと status.json の内容)だけ返し、判断は呼び出し側に渡す。
