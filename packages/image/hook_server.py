@@ -45,9 +45,20 @@ WORKDIR_BASE = "/tmp/kiro-work"
 # repoUrl 未指定時の baseBranch 既定。
 DEFAULT_BASE_BRANCH = "main"
 
-# GitHub への commit に使う固定 author(実行者個人を識別しない bot 表記)。
+# GitHub への commit に使う author の既定値(未指定時。実行者個人を識別しない bot 表記)。
+# デプロイ時に環境変数 KIRO_GIT_AUTHOR_NAME / KIRO_GIT_AUTHOR_EMAIL で上書きできる。
 GIT_AUTHOR_NAME = "kiro-bot"
 GIT_AUTHOR_EMAIL = "kiro-bot@users.noreply.github.com"
+
+# author 上書き用の環境変数名(CDK が CfnMicrovmImage の environmentVariables で注入する)。
+GIT_AUTHOR_NAME_ENV = "KIRO_GIT_AUTHOR_NAME"
+GIT_AUTHOR_EMAIL_ENV = "KIRO_GIT_AUTHOR_EMAIL"
+
+# 禁止文字: 制御文字(U+0000-U+001F, U+007F)と " \ ` $ < >。
+# 値はプロンプト内の `git config user.name "<値>"` としてシェルで実行されるため、
+# 引用・展開を壊す文字を拒否する。< > は git の ident で使えない。
+_GIT_AUTHOR_FORBIDDEN_PATTERN = re.compile(r'[\x00-\x1f\x7f"\\`$<>]')
+_GIT_AUTHOR_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+$")
 
 # GIT_ASKPASS で使う helper スクリプトのファイル名(Kiro の HOME 配下に置く)。
 GIT_ASKPASS_FILENAME = "git-askpass.sh"
@@ -451,24 +462,52 @@ def render_askpass_script(secret_arn):
     )
 
 
+def resolve_git_author(environ=None):
+    """commit author を (name, email) で返す。項目ごとに独立して解決する。
+
+    未設定・trim 後に空なら既定値。検証 NG なら警告ログ(変数名のみ)を出して既定値。
+    """
+    if environ is None:
+        environ = os.environ
+
+    def _resolve(env_name, default, is_email):
+        value = (environ.get(env_name) or "").strip()
+        if not value:
+            return default
+        ok = not _GIT_AUTHOR_FORBIDDEN_PATTERN.search(value)
+        if ok and is_email:
+            ok = _GIT_AUTHOR_EMAIL_PATTERN.match(value) is not None
+        if not ok:
+            log(f"{env_name} is invalid; falling back to default")
+            return default
+        return value
+
+    return (
+        _resolve(GIT_AUTHOR_NAME_ENV, GIT_AUTHOR_NAME, False),
+        _resolve(GIT_AUTHOR_EMAIL_ENV, GIT_AUTHOR_EMAIL, True),
+    )
+
+
 def build_git_env(home_dir):
     """Kiro 子プロセスに重ねる git 認証用 env 差分を返す。
 
     - HOME: 専用 HOME(askpass helper と git 設定の置き場)。
     - GIT_ASKPASS: helper スクリプトの絶対パス。
     - GIT_TERMINAL_PROMPT=0: 端末での対話的資格情報入力を禁止(無人実行の保険)。
-    - GIT_AUTHOR_* / GIT_COMMITTER_*: commit author/committer を kiro-bot に固定。
+    - GIT_AUTHOR_* / GIT_COMMITTER_*: commit author/committer をデプロイ時設定の author
+      (未指定時は kiro-bot)にする。
       プロンプトの `git config` 指示に加えて env でも確定させ、Kiro が config を
       省いても個人を識別しない bot 表記で commit されるようにする。
     """
+    author_name, author_email = resolve_git_author()
     return {
         "HOME": home_dir,
         "GIT_ASKPASS": os.path.join(home_dir, GIT_ASKPASS_FILENAME),
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_AUTHOR_NAME": GIT_AUTHOR_NAME,
-        "GIT_AUTHOR_EMAIL": GIT_AUTHOR_EMAIL,
-        "GIT_COMMITTER_NAME": GIT_AUTHOR_NAME,
-        "GIT_COMMITTER_EMAIL": GIT_AUTHOR_EMAIL,
+        "GIT_AUTHOR_NAME": author_name,
+        "GIT_AUTHOR_EMAIL": author_email,
+        "GIT_COMMITTER_NAME": author_name,
+        "GIT_COMMITTER_EMAIL": author_email,
     }
 
 
@@ -576,6 +615,7 @@ def build_repo_prompt(repo_url, base_branch, request_id, user_prompt):
     # clone 後・作業前に、イメージ同梱のグローバル steering を clone 先へ配置する手順。
     # steering が無ければ空文字列になり、従来のプロンプト文面と一致する。
     steering_step = build_steering_fallback_instructions(read_global_steering_files())
+    author_name, author_email = resolve_git_author()
     return (
         "あなたは Git リポジトリ上で作業する開発エージェントです。"
         "以下の手順を順番に実行してください。\n"
@@ -591,8 +631,8 @@ def build_repo_prompt(repo_url, base_branch, request_id, user_prompt):
         f"1. カレントディレクトリに `git clone {repo_url}` でリポジトリを clone し、"
         "clone したディレクトリに移動する。\n"
         f"{steering_step}"
-        f"2. `git config user.name \"{GIT_AUTHOR_NAME}\"` と "
-        f"`git config user.email \"{GIT_AUTHOR_EMAIL}\"` を設定する(commit author を固定する)。\n"
+        f"2. `git config user.name \"{author_name}\"` と "
+        f"`git config user.email \"{author_email}\"` を設定する(commit author を固定する)。\n"
         f"3. `git checkout {base_branch}` の後、`git checkout -b {branch}` で作業ブランチを作成する。\n"
         f"4. 次の作業指示を実施する:\n"
         f"   {user_prompt}\n"
