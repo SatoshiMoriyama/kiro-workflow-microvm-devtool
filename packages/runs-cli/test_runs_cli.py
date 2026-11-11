@@ -541,7 +541,8 @@ class TestCmdShow(unittest.TestCase):
 class TestCmdStats(unittest.TestCase):
     """cmd_stats.run の集計・整形・JSON 出力を検証する(別クラス)。"""
 
-    def _run(self, request_id, ok=None, broken=False, started=None, finished=None):
+    def _run(self, request_id, ok=None, broken=False, started=None, finished=None,
+             credits_used=None):
         """テスト用に Run を直接組む小ヘルパ。"""
         return loader.Run(
             request_id=request_id,
@@ -559,6 +560,7 @@ class TestCmdStats(unittest.TestCase):
             summary=None,
             path="/tmp/" + request_id,
             broken=broken,
+            credits_used=credits_used,
         )
 
     def _make_runs(self):
@@ -620,7 +622,10 @@ class TestCmdStats(unittest.TestCase):
         data = json.loads(out)
         self.assertEqual(
             set(data.keys()),
-            {"total", "ok", "failed", "broken", "successRate", "avgDurationSeconds"},
+            {
+                "total", "ok", "failed", "broken", "successRate",
+                "avgDurationSeconds", "creditsTotal", "creditsUnavailable",
+            },
         )
 
     def test_empty_runs_none_values(self):
@@ -670,6 +675,80 @@ class TestCmdStats(unittest.TestCase):
         self.assertEqual(data["ok"], 1)
         self.assertEqual(data["failed"], 2)
         self.assertEqual(data["broken"], 1)
+
+    def test_credits_total_and_unavailable(self):
+        runs = [
+            self._run("c1", ok=True, credits_used=1.5),
+            self._run("c2", ok=False, credits_used=2.25),
+            self._run("c3", ok=True),                      # None
+            self._run("c4", broken=True),                  # broken も None
+        ]
+        _, out = self._capture(runs, self._Args(json=True))
+        data = json.loads(out)
+        self.assertEqual(data["creditsTotal"], 3.75)
+        self.assertEqual(data["creditsUnavailable"], 2)
+        self.assertEqual(data["creditsUnavailable"] + 2, data["total"])
+
+    def test_credits_all_none(self):
+        runs = [self._run("n1", ok=True), self._run("n2", broken=True)]
+        _, out = self._capture(runs, self._Args(json=True))
+        data = json.loads(out)
+        self.assertIsNone(data["creditsTotal"])
+        self.assertEqual(data["creditsUnavailable"], 2)
+        _, human = self._capture(runs, self._Args(json=False))
+        self.assertIn("クレジット合計", human)
+        self.assertIn("取得不可 2 件", human)
+        self.assertIn("N/A", human)
+
+    def test_credits_empty_runs(self):
+        _, out = self._capture([], self._Args(json=True))
+        data = json.loads(out)
+        self.assertIsNone(data["creditsTotal"])
+        self.assertEqual(data["creditsUnavailable"], 0)
+
+    def test_credits_human_output(self):
+        runs = [self._run("h1", ok=True, credits_used=0.5),
+                self._run("h2", ok=True)]
+        _, out = self._capture(runs, self._Args(json=False))
+        self.assertIn("クレジット合計", out)
+        self.assertIn("0.5 credits", out)
+        self.assertIn("取得不可 1 件", out)
+
+
+class TestLoaderCredits(unittest.TestCase):
+    """loader が status.json の creditsUsed を credits_used へ読む挙動を検証する。"""
+
+    def _load_one(self, status_extra, key_present=True, value=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = _make_run_dir(tmp, "req-c")
+            status = {"requestId": "req-c", "ok": True}
+            if key_present:
+                status["creditsUsed"] = value
+            _write_json(os.path.join(d, "status.json"), status)
+            runs = loader.load_runs(tmp)
+        self.assertEqual(len(runs), 1)
+        return runs[0]
+
+    def test_int_and_float_become_float(self):
+        r = self._load_one(None, value=3)
+        self.assertEqual(r.credits_used, 3.0)
+        self.assertIsInstance(r.credits_used, float)
+        r = self._load_one(None, value=0.123456789)
+        self.assertEqual(r.credits_used, 0.123456789)
+
+    def test_non_numeric_become_none(self):
+        self.assertIsNone(self._load_one(None, value=None).credits_used)
+        self.assertIsNone(self._load_one(None, key_present=False).credits_used)
+        self.assertIsNone(self._load_one(None, value="1.5").credits_used)
+        self.assertIsNone(self._load_one(None, value=True).credits_used)
+        self.assertIsNone(self._load_one(None, value=False).credits_used)
+
+    def test_broken_run_is_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_run_dir(tmp, "req-b")  # status.json 無し -> broken
+            runs = loader.load_runs(tmp)
+        self.assertTrue(runs[0].broken)
+        self.assertIsNone(runs[0].credits_used)
 
 
 class TestMainDispatch(unittest.TestCase):
