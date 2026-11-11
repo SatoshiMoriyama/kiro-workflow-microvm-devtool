@@ -15,6 +15,11 @@ load_runs が返す Run のリストを集計し、人間向け整形表示ま�
                 総 run 数が 0 のときは None 相当とする。
 - 平均実行時間 : duration_seconds が算出できた run のみで平均(秒)。
                 算出可能な run が 0 件なら None 相当とする。
+- クレジット合計(creditsTotal): credits_used が None でない run の合計
+                (丸めない)。該当 run が 0 件なら None 相当とする。
+- クレジット取得不可(creditsUnavailable): credits_used が None の run 数
+                (broken も含む)。creditsUnavailable + (credits_used が数値の
+                run 数) == total が常に成立する。
 """
 
 from __future__ import annotations
@@ -43,6 +48,11 @@ def _aggregate(runs: list[Run]) -> dict:
     ]
     avg_duration = (sum(durations) / len(durations)) if durations else None
 
+    # クレジットは数値の run のみ合計する(丸めない)。0 件なら None。
+    credits = [r.credits_used for r in runs if r.credits_used is not None]
+    credits_total = sum(credits) if credits else None
+    credits_unavailable = total - len(credits)
+
     return {
         "total": total,
         "ok": ok,
@@ -50,6 +60,8 @@ def _aggregate(runs: list[Run]) -> dict:
         "broken": broken,
         "successRate": success_rate,
         "avgDurationSeconds": avg_duration,
+        "creditsTotal": credits_total,
+        "creditsUnavailable": credits_unavailable,
     }
 
 
@@ -61,6 +73,9 @@ def _format_human(stats: dict) -> str:
     avg = stats["avgDurationSeconds"]
     avg_str = f"{avg:.1f} 秒" if avg is not None else "N/A"
 
+    credits = stats["creditsTotal"]
+    credits_str = str(credits) if credits is not None else "N/A"
+
     lines = [
         "run 集計サマリ",
         f"  総 run 数     : {stats['total']}",
@@ -69,6 +84,8 @@ def _format_human(stats: dict) -> str:
         f"  壊れ数        : {stats['broken']}",
         f"  成功率        : {rate_str}",
         f"  平均実行時間  : {avg_str}",
+        f"  クレジット合計  : {credits_str} credits"
+        f"(取得不可 {stats['creditsUnavailable']} 件)",
     ]
     return "\n".join(lines)
 
