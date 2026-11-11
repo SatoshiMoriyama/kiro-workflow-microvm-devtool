@@ -97,6 +97,9 @@ fix-loop   : 集約 verdict が APPROVED でなければ pause しユーザー�
 pr         : APPROVED 後、統合ブランチ → main の PR を作成(手元側 coder, gh)。
              本文は各タスクの report.md/status.json とレビュー結果を統合。
              gh-cli ルール: 本文は fs_write で一時ファイルに書き --body-file で渡し、作成後に削除。
+             使用クレジット: lead・parallel・fix-loop の各ステップが報告した全 requestId について
+             results/<requestId>/status.json の creditsUsed を合算し、合計クレジットと「取得不可」件数
+             (creditsUsed が null・キー欠落・status.json 欠損のラン)を PR 本文と完了通知に載せる。
 ```
 
 workflowPrompt に必ず含める事項:
@@ -108,8 +111,36 @@ workflowPrompt に必ず含める事項:
 - レビューは全並列マージ後に 1 回、Claude 中量級 + GPT 中量級 + 中量級集約。モデル ID は生きた一覧から解決(ハードコード不可)。
 - 指摘対応は常に新規ブランチで MicroVM。maxIterations 3。APPROVED でない周は pause してユーザー判断を仰ぐ。確定仕様と矛盾する指摘は rejected 理由を付けて残す。
 - 並列タスク同士はファイル重複ゼロで分割し競合を避ける。重複する共通部分は先行タスクへ寄せる。同時並列は最大 3、超過はキューイング。
+- MicroVM 実行ステップ(lead・parallel・fix-loop)は requestId を必ず報告すること。pr ステップはそれらの requestId から `results/<requestId>/status.json` の `creditsUsed` を合算し、合計を PR 本文(例: 「使用クレジット」節)と完了通知に載せること。取得不可のラン(creditsUsed が null・キー欠落・status.json 欠損)は件数を別に数え、合計に 0 として混ぜないこと。ラン別の内訳(requestId・タスク名・creditsUsed)も載せること。合算手順は下の「使用クレジットの合算」に従う。
 - 成果物の地の文は日本語。コード識別子・パス・コマンド・ブランチ名・JSON のキー/値は原文のまま。コミットは Conventional Commits 一行。
 - 各 MicroVM 実行ステップの PROMPT(分割後の各タスク指示)は run-microvm 経由で **S3** から渡るため、長い日本語のままでよい(手動の圧縮・英訳は不要)。split ステップが分割した各タスク PROMPT を日本語で詳細に書いてよく、payload の 4096 バイト制限を意識して切り詰める必要はない(run.sh が PROMPT を `<requestId>/inputs/prompt.md` へ逃がし、payload サイズを事前検証する)。
+
+#### 使用クレジットの合算
+
+合算対象は今回のパイプラインで実行した requestId だけであり、`pnpm runs:stats` の合計(results/ 全体、他パイプラインのランを含む)とは別物なので、パイプラインの合算には使わない。ワークスペースルートで requestId を引数に渡す:
+
+```bash
+python3 - req-AAA req-BBB req-CCC <<'PY'
+import json, sys
+total, missing, rows = 0, 0, []
+for rid in sys.argv[1:]:
+    try:
+        with open(f"results/{rid}/status.json", encoding="utf-8") as f:
+            c = json.load(f).get("creditsUsed")
+    except (OSError, ValueError, AttributeError):
+        c = None
+    if isinstance(c, (int, float)) and not isinstance(c, bool):
+        total += c
+    else:
+        c, missing = None, missing + 1
+    rows.append((rid, c))
+print(f"total_credits={total} unavailable={missing}")
+for rid, c in rows:
+    print(f"{rid}\t{'取得不可' if c is None else c}")
+PY
+```
+
+タスク名は出力に含まれないので、requestId とタスク名の対応は各ステップの報告から補って内訳に載せる。
 
 ### 3. 分割の指針(split ステップへ渡す判断基準)
 
