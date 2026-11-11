@@ -9,6 +9,7 @@ default_results_dir)は並列タスク(cmd_list / cmd_show / cmd_stats)との
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,10 @@ class Run:
     """1 つの run を表す正規化済みデータ。
 
     フィールド名は並列タスクが import するため厳密に維持すること(snake_case)。
+
+    credits_used は kiro-cli の使用クレジット(単位 credit、丸めなし)。
+    status.json の creditsUsed が数値のときだけ float で入り、null・キー欠落
+    (古いラン)・数値でない値(非有限値 NaN/Infinity を含む)・broken な run では None(取得不可)となる。
     """
 
     request_id: str
@@ -36,12 +41,22 @@ class Run:
     summary: str | None
     path: str
     broken: bool = False
+    credits_used: float | None = None
 
 
 def _read_json(path: str):
     """JSON ファイルを読む。存在しない・壊れている場合は例外を送出する。"""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _parse_credits(value) -> float | None:
+    """creditsUsed を float へ正規化する。int/float(bool 除く)以外と非有限値(NaN/Infinity)は None。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
 
 
 def _run_from_status(request_id: str, abs_dir: str, status: dict) -> Run:
@@ -62,6 +77,7 @@ def _run_from_status(request_id: str, abs_dir: str, status: dict) -> Run:
         summary=None,
         path=abs_dir,
         broken=False,
+        credits_used=_parse_credits(status.get("creditsUsed")),
     )
 
 
