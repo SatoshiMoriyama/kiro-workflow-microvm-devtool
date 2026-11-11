@@ -387,6 +387,14 @@ class TestParseKiroStreamJson(unittest.TestCase):
         text = self._usage([self._credit(True), self._credit(0.5)])
         self.assertEqual(hs.parse_kiro_stream_json(text), (None, 0.5))
 
+    def test_non_finite_usage_ignored(self):
+        text = self._usage([self._credit(float("nan")), self._credit(0.5),
+                            self._credit(float("inf")), self._credit(float("-inf"))])
+        # json.dumps は NaN/Infinity をそのまま出力し、json.loads も受理する
+        self.assertEqual(hs.parse_kiro_stream_json(text), (None, 0.5))
+        text = self._usage([self._credit(float("nan")), self._credit(float("inf"))])
+        self.assertEqual(hs.parse_kiro_stream_json(text), (None, None))
+
     def test_credits_not_list_is_none(self):
         self.assertEqual(hs.parse_kiro_stream_json(self._usage("x")), (None, None))
 
@@ -478,6 +486,29 @@ class TestRunKiroStreamJson(TestRunKiroUploadFailures):
         argv = run.call_args[0][0]
         self.assertIn("--output-format", argv)
         self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
+
+    def test_timeout_discards_partial_credits(self):
+        raw = self._stream("partial")
+        exc = hs.subprocess.TimeoutExpired(cmd="kiro-cli", timeout=1, output=raw)
+        puts = {}
+
+        def put_bytes(bucket, key, data):
+            puts[key] = data
+            return (True, "s3://ok")
+
+        with unittest.mock.patch.object(
+            hs.subprocess, "run", side_effect=exc
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_bytes", side_effect=put_bytes
+        ), unittest.mock.patch.object(
+            hs, "_s3_put_file", return_value=(True, "s3://ok")
+        ):
+            ok, status = hs.run_kiro_and_upload(f"{self._req}/runs/", self._req, "p")
+        self.assertFalse(ok)
+        self.assertTrue(status["timedOut"])
+        self.assertIsNone(status["creditsUsed"])
+        # finalText の扱いは従来どおり(部分 stdout を解析して使う)
+        self.assertEqual(puts[f"{self._req}/runs/" + "kiro-stdout.txt"], b"partial")
 
     def test_text_stdout_fallback(self):
         ok, status, puts, _ = self._run(b"done")

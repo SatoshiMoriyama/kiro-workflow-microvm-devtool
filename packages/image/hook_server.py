@@ -25,6 +25,7 @@ KIRO_API_KEY の値は CloudWatch Logs・S3 成果物・status.json・レスポ�
 
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -275,7 +276,7 @@ def parse_kiro_stream_json(text):
     戻り値: (final_text, credits_used)。
     - final_text: 最後の runFinished イベントの data.finalText(str)。無ければ None。
     - credits_used: 最後の session_usage イベントの credits のうち、unit が "credit" で
-      usage が int/float(bool 除外)の要素の usage 合計(float、丸めなし)。無ければ None。
+      usage が有限の int/float(bool・NaN・Infinity 除外)の要素の usage 合計(float、丸めなし)。無ければ None。
     不正な行・想定外の形式は読み飛ばし、例外は外に出さず見つからなければ None。
     """
     final_text = None
@@ -317,6 +318,8 @@ def parse_kiro_stream_json(text):
                     continue
                 usage = item.get("usage")
                 if isinstance(usage, bool) or not isinstance(usage, (int, float)):
+                    continue
+                if not math.isfinite(usage):
                     continue
                 total += float(usage)
                 matched = True
@@ -999,6 +1002,9 @@ def run_kiro_and_upload(prefix, request_id, prompt, repo_url=None,
     # ⑤ stdout をマスクして put
     stdout_text = stdout_bytes.decode("utf-8", "replace")
     final_text, credits_used = parse_kiro_stream_json(stdout_text)
+    if timed_out:
+        # タイムアウト時の session_usage は途中値なので creditsUsed は null とする。
+        credits_used = None
     # final_text が取れなければ(旧形式・解析不能・タイムアウト等)従来どおり全文。
     stdout_body = final_text if final_text is not None else stdout_text
     stdout_masked = mask_secrets(stdout_body, secret_values)
