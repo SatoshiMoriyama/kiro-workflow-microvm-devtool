@@ -743,6 +743,10 @@ class TestLoaderCredits(unittest.TestCase):
         self.assertIsNone(self._load_one(None, value=True).credits_used)
         self.assertIsNone(self._load_one(None, value=False).credits_used)
 
+    def test_non_finite_become_none(self):
+        for v in (float("nan"), float("inf"), float("-inf")):
+            self.assertIsNone(self._load_one(None, value=v).credits_used)
+
     def test_broken_run_is_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             _make_run_dir(tmp, "req-b")  # status.json 無し -> broken

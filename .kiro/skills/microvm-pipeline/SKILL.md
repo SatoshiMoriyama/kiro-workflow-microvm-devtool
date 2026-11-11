@@ -121,7 +121,7 @@ workflowPrompt に必ず含める事項:
 
 ```bash
 python3 - req-AAA req-BBB req-CCC <<'PY'
-import json, sys
+import json, math, sys
 total, missing, rows = 0, 0, []
 for rid in sys.argv[1:]:
     try:
@@ -129,7 +129,7 @@ for rid in sys.argv[1:]:
             c = json.load(f).get("creditsUsed")
     except (OSError, ValueError, AttributeError):
         c = None
-    if isinstance(c, (int, float)) and not isinstance(c, bool):
+    if isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c):
         total += c
     else:
         c, missing = None, missing + 1
