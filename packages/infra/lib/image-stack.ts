@@ -15,6 +15,44 @@ export interface ImageStackProps extends cdk.StackProps {
   readonly logGroup: logs.ILogGroup;
   readonly apiKeySecret: secretsmanager.ISecret;
   readonly githubTokenSecret: secretsmanager.ISecret;
+  /**
+   * MicroVM 内 kiro-cli の実装コミットの author 名。
+   * 未指定時はイメージ側既定の kiro-bot。
+   */
+  readonly gitAuthorName?: string;
+  /**
+   * MicroVM 内 kiro-cli の実装コミットの author メール。
+   * 未指定時はイメージ側既定の kiro-bot@users.noreply.github.com。
+   */
+  readonly gitAuthorEmail?: string;
+}
+
+// 禁止文字: 制御文字(U+0000-U+001F, U+007F)と " \ ` $ < >。
+// 値は PROMPT 内の `git config user.name "<値>"` としてシェル実行されるため、
+// 引用・展開を壊す文字を拒否する。< > は git の ident で使えない。
+// packages/image/hook_server.py の検証規則と同一にすること。
+const FORBIDDEN_CHARS = /[\x00-\x1f\x7f"\\`$<>]/;
+const EMAIL_FORMAT = /^[^@\s]+@[^@\s]+$/;
+
+/** trim して空なら undefined。不正なら Error を throw する。 */
+function validateGitAuthor(
+  kind: "name" | "email",
+  inputName: string,
+  raw: string | undefined,
+): string | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  if (FORBIDDEN_CHARS.test(value)) {
+    throw new Error(
+      `${inputName} is invalid: must not contain control characters or any of " \\ \` $ < > (value: ${JSON.stringify(value)})`,
+    );
+  }
+  if (kind === "email" && !EMAIL_FORMAT.test(value)) {
+    throw new Error(
+      `${inputName} is invalid: must match ${EMAIL_FORMAT} (value: ${JSON.stringify(value)})`,
+    );
+  }
+  return value;
 }
 
 /**
@@ -52,6 +90,17 @@ export class ImageStack extends cdk.Stack {
       `arn:aws:lambda:${region}:aws:network-connector:aws-network-connector:${name}`;
     const internetEgressArn = connectorArn("INTERNET_EGRESS");
 
+    const gitAuthorName = validateGitAuthor(
+      "name",
+      "gitAuthorName / KIRO_GIT_AUTHOR_NAME",
+      props.gitAuthorName,
+    );
+    const gitAuthorEmail = validateGitAuthor(
+      "email",
+      "gitAuthorEmail / KIRO_GIT_AUTHOR_EMAIL",
+      props.gitAuthorEmail,
+    );
+
     const image = new CfnMicrovmImage(this, "KiroMicrovmImage", {
       name: "kiro-microvm",
       description:
@@ -79,6 +128,13 @@ export class ImageStack extends cdk.Stack {
           key: "GITHUB_TOKEN_SECRET_ARN",
           value: props.githubTokenSecret.secretArn,
         },
+        // デプロイ時設定のコミット author。未指定ならイメージ側(hook_server.py)既定の kiro-bot。
+        ...(gitAuthorName
+          ? [{ key: "KIRO_GIT_AUTHOR_NAME", value: gitAuthorName }]
+          : []),
+        ...(gitAuthorEmail
+          ? [{ key: "KIRO_GIT_AUTHOR_EMAIL", value: gitAuthorEmail }]
+          : []),
       ],
       // ready/run はフックの有効化フラグ(ENABLED/DISABLED)。
       // 実際のパス(/aws/lambda-microvms/runtime/v1/{ready,run})はサーバ側が実装する。
