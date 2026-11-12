@@ -7,29 +7,31 @@ description: 1 つの依頼を「先行(共通基盤)タスク」と「並列可
 
 1 件の実装依頼を、MicroVM 上の kiro-cli を複数使って実装する動的パイプライン。**作業分解 → 先行タスク → 先行マージ → 並列タスク → 全並列マージ → まとめてマルチモデルレビュー → 指摘対応ループ → PR** までを **1 つの run_workflow** にまとめて実行する。
 
+ステップ固有ルールの一次ソースは `.kiro/agents/` の専用エージェント定義(microvm-split / microvm-run / microvm-merge / microvm-pr)。このスキルには全体構成・レビュー方針・pause 仲介だけを残し、同じルールを二重に書かない。
+
 このスキルの役割は、依頼を受けて 1 本の workflow を組み立て(run_workflow の workflowPrompt)、起動することと、workflow が pause してユーザー判断を求めてきたときに仲介すること。構成は依頼ごとに分割数・依存関係が変わるため固定レシピにはせず、毎回 workflowPrompt で生成する。workflow の先頭に作業分解ステップを置き、その結果で後続を `replace_remaining` により動的生成する。
 
 ## 責務の境界(最重要)
 
 - **MicroVM 内の kiro-cli**: 各タスクの「実装そのもの」だけ(clone → ブランチ作成 → 作業 → commit → push)。マージ・PR・レビューはしない。
-- **workflow 内の coder ステップ(手元側, MicroVM 外)**: 統合ブランチ作成、`pnpm run-microvm` の起動と結果回収、結果判定、マージ、マージ済み作業ブランチ(kiro/<requestId>)の origin からの削除、PR 作成。git 操作とマージは MicroVM にはやらせず、この手元側ステップが担う。
+- **workflow 内の手元側ステップ(MicroVM 外)**: 統合ブランチ作成、`pnpm run-microvm` の起動と結果回収、マージ、マージ済み作業ブランチの削除、PR 作成。git 操作とマージは MicroVM にはやらせず、専用エージェント(microvm-run / microvm-merge / microvm-pr)が担う。
 - **workflow 内のレビュー/集約ステップ**: マルチモデルレビューと集約。
 - **このスキル(オーケストレーター)**: 入力を聞き、workflow を組んで起動し、pause 時にユーザーへ判断を仲介する。
 
 ## 前提
 
-- run-microvm skill(.kiro/skills/run-microvm/SKILL.md)と同じ MicroVM 実行基盤を使う。各タスク実行はその skill の手順(`pnpm run-microvm` を REPO_URL/BASE_BRANCH/PROMPT で叩き、results/<requestId>/ を回収)に従う。MicroVM 実行を行う coder ステップのサブエージェントには run-microvm skill を disclose_context で起動させる、と workflowPrompt に明記する。
+- run-microvm skill(.kiro/skills/run-microvm/SKILL.md)と同じ MicroVM 実行基盤を使う。各タスク実行の手順は microvm-run エージェント(`.kiro/agents/microvm-run.md`)が run-microvm skill に従って行う。
 - GitHub フロー前提。REPO_URL が必須(https://github.com/owner/repo.git)。デプロイ済み・Secret(kiro-api-key / github-token)投入済み・AWS SSO 有効・gh 認証済みであること。未整備なら run-microvm skill のガードに従い中断・報告する。
-- **AWS プロファイルは必須入力。既定のフォールバックは無い**(公開前提)。ステップ 1 で毎回ユーザーに聞き、workflowPrompt に明記して各 MicroVM 実行ステップへ `AWS_PROFILE=<profile>` として渡す。
+- **AWS プロファイルは必須入力。既定のフォールバックは無い**(公開前提)。手順 1 で毎回ユーザーに聞き、workflowPrompt に明記して各ステップへ渡す。
 - MicroVM の GitHub フローは「渡された base ブランチを clone → kiro/<requestId> ブランチを切って作業 → push」までで、マージはしない。base は run-microvm に BASE_BRANCH で渡す。
-- MicroVM が作る実装コミットの author はデプロイ時設定(未指定時 `kiro-bot <kiro-bot@users.noreply.github.com>`、詳細は README「コミット author の設定」)で、パイプラインやラン単位では変えない。手元側 coder ステップが作るマージコミットは手元の git 設定の author になる。両者を同じ名義にしたい場合は、デプロイ時に手元と同じ author(GitHub アカウントに紐づくメール)を設定する。
+- MicroVM が作る実装コミットの author はデプロイ時設定(未指定時 `kiro-bot <kiro-bot@users.noreply.github.com>`、詳細は README「コミット author の設定」)で、パイプラインやラン単位では変えない。microvm-merge が作るマージコミットは手元の git 設定の author になる。両者を同じ名義にしたい場合は、デプロイ時に手元と同じ author(GitHub アカウントに紐づくメール)を設定する。
 - レビューは workflow-review.md(ユーザーのグローバル steering)に従う: Claude 中量級 + GPT 中量級の 2 系統並列 + 中量級の集約。高級モデル・高 effort は使わない。モデル ID は実行環境の生きた一覧から解決する(ハードコードしない)。
 
 ## ブランチ構造
 
 ```
 main
- └─ 統合ブランチ (feature/<機能名>)                          ← workflow が main から作成し origin へ push
+ └─ 統合ブランチ (feature/<機能名>)                          ← microvm-merge が main から作成し origin へ push
      ├─ 先行タスク   : 統合ブランチを base に clone → kiro/<reqId> → push → 統合ブランチへマージ → origin 更新 → kiro/<reqId> 削除
      ├─ 並列タスクA  : 更新済み統合ブランチを base に clone → kiro/<reqId> → push ┐
      ├─ 並列タスクB  : 同上                                                       ├ 全完了後に順次マージ → 各 kiro/<reqId> 削除
@@ -39,23 +41,14 @@ main
  → APPROVED になったら 統合ブランチ → main の PR を作成
 ```
 
-**作業ブランチ kiro/<requestId> の削除**: マージ工程(lead / merge-all / fix-loop)は、統合ブランチへのマージを origin へ push した直後に、取り込んだ kiro/<requestId> を origin から削除する。削除前に取り込み済みであることを必ず確認する。
-
-1. `git fetch origin`
-2. `git merge-base --is-ancestor origin/kiro/<requestId> origin/feature/<機能名>` が成功(exit 0)することを確認
-3. 成功時のみ `git push origin --delete kiro/<requestId>`
-
-- 2 が失敗したブランチは消さない。残したブランチ名と理由をステップ報告に書く。
-- マージしなかった kiro/*(ok=false、PROMPT 取り違えで破棄した run、非自明な競合で再実行に回した run など)は自動で消さない。ブランチ名と理由をステップ報告に残し、削除するかはユーザーが判断する。
-- 削除の失敗(権限不足・既に存在しない等)ではパイプラインを止めない。残ったブランチとして報告し、pr ステップの完了報告に残存 kiro/* の一覧を載せる。
-- 削除するのは今回の run で作られた kiro/<requestId> だけ。他の run のブランチや統合ブランチ・main には触らない。
+作業ブランチ kiro/<requestId> は、統合ブランチへマージして push した後に origin から削除する。確認手順と例外は `.kiro/agents/microvm-merge.md` を参照。
 
 **統合ブランチの命名**: 依頼内容(機能)が分かる名前。例 `feature/user-auth`。`microvm-pipeline` 等のツール名・パイプライン名キーワードは入れない。機能名は作業分解ステップで依頼から決める。
 
 ## レビューと指摘対応の方針(確定事項)
 
 - **レビューのタイミング**: 並列タスクを個別にレビューしない。**全並列タスクを統合ブランチにマージし終えてから、統合ブランチ全体(main との diff)を 1 回だけ**まとめてマルチモデルレビューする。先行タスクも統合ブランチに含まれるので一括で見る。タスク横断の整合性もここで見る。
-- **指摘対応は常に新規ブランチで MicroVM**: 集約 verdict が APPROVED でなく、ユーザーが「直す」と判断した指摘は、MicroVM で修正する。修正は**必ず新しい kiro/<requestId> を切る**(既存ブランチは使い回さない)。修正対象の最新統合ブランチを BASE_BRANCH にして clone させ、指摘の要点(対象ファイル・直す内容)を PROMPT に渡す。push 後、手元側 coder ステップが統合ブランチへマージして再レビューする。
+- **指摘対応は常に新規ブランチで MicroVM**: 集約 verdict が APPROVED でなく、ユーザーが「直す」と判断した指摘は、MicroVM で修正する。修正は**必ず新しい kiro/<requestId> を切る**(既存ブランチは使い回さない)。修正対象の最新統合ブランチを BASE_BRANCH にして clone させ、指摘の要点(対象ファイル・直す内容)を PROMPT に渡す。push 後、microvm-merge が統合ブランチへマージして再レビューする。
 - **ループ上限**: レビュー→指摘対応の実装ループは maxIterations 3。3 周で APPROVED に至らなければ onMaxIterations で pause。
 - **集約後はユーザー判断を仰ぐ**: 集約 verdict が APPROVED でない周は、自動で次の指摘対応へ回さず、send_message(severity=warning) で pause し、集約結果(blocking/non-blocking、各指摘の対象ファイルと概要、アグリゲーターが rejected と判断した指摘はその理由)を提示してユーザーに「対応/却下/見送り」を仰ぐ。APPROVED なら pause せず PR へ進む。
 - **確定仕様と矛盾する指摘は reject**: 集約ステップは各指摘が今回のブランチの変更に対するものか(base からの diff か)を検証し、確定方針・設計と矛盾する指摘は rejected 理由を付けて残す(握り潰さず残す)。
@@ -71,86 +64,26 @@ main
 
 ### 2. 1 本の workflow を組んで起動する
 
-run_workflow の workflowPrompt に、次の構成の 1 本のパイプラインを記述して起動する。先頭の作業分解ステップの結果で後続を `replace_remaining` により動的生成する旨も明記する。
+run_workflow の workflowPrompt に 1 本のパイプラインを記述して起動する。先頭の split の結果で後続を `replace_remaining` により動的生成する(生成は microvm-split が行う)。各ステップは次の専用エージェントを使う。ルール本文は各エージェント定義にあり、workflowPrompt には書き写さない。
 
-想定ステップ構成(分割数・依存で可変):
-
-```
-split      : 依頼を先行/並列に分解(planner)。機能名・統合ブランチ名・先行の有無・
-             並列タスクのリストと各 PROMPT・依存関係を決める。結果をユーザーに提示し、
-             承認を得てから replace_remaining で後続ステップを生成する。
-setup      : main から統合ブランチ feature/<機能名> を作成し origin へ push(手元側 coder)。
-lead       : 先行タスク(あれば)を MicroVM 実行(coder + run-microvm skill,
-             BASE_BRANCH=feature/<機能名>)。ok 判定し、合格なら統合ブランチへマージ・origin 更新・
-             取り込み済み確認のうえ kiro/<reqId> を origin から削除。
-             ok=false/push失敗/未実行なら pause してユーザーに報告。
-parallel   : 並列タスクを MicroVM 同時実行(parallel, join allSettled, 最大 3,
-             BASE_BRANCH=更新済み feature/<機能名>)。
-merge-all  : 全並列ブランチを統合ブランチへ順次マージ(手元側 coder, 1 本ずつ fetch→merge→push→
-             取り込み済み確認→kiro/<reqId> を origin から削除)。
-             ok=false/push失敗の run は pause して報告。
-review     : 統合ブランチ全体(main との diff)をまとめてマルチモデルレビュー
-             (parallel: review-claude[claude 中量級] / review-gpt[gpt 中量級] → aggregate[中量級集約])。
-fix-loop   : 集約 verdict が APPROVED でなければ pause しユーザー判断を仰ぐ。ユーザーが直すと
-             判断した指摘を MicroVM で修正(新規 kiro/<reqId>, BASE_BRANCH=最新統合ブランチ)→
-             マージ→取り込み済み確認→kiro/<reqId> を origin から削除→再レビュー。
-             maxIterations 3。APPROVED で抜ける。
-pr         : APPROVED 後、統合ブランチ → main の PR を作成(手元側 coder, gh)。
-             本文は各タスクの report.md/status.json とレビュー結果を統合。
-             gh-cli ルール: 本文は fs_write で一時ファイルに書き --body-file で渡し、作成後に削除。
-             使用クレジット: lead・parallel・fix-loop の各ステップが報告した全 requestId について
-             results/<requestId>/status.json の creditsUsed を合算し、合計クレジットと「取得不可」件数
-             (creditsUsed が null・キー欠落・status.json 欠損のラン)を PR 本文と完了通知に載せる。
-```
+| ステップ | 担当エージェント |
+| --- | --- |
+| split | microvm-split |
+| setup | microvm-merge |
+| lead(先行タスクがある場合) | microvm-run → microvm-merge |
+| parallel(join allSettled、最大 3) | microvm-run |
+| merge-all | microvm-merge |
+| review | semantic_reviewer × 2(Claude 中量級 / GPT 中量級)+ wf-review-aggregator |
+| fix-loop(maxIterations 3) | microvm-run → microvm-merge → 再レビュー |
+| pr | microvm-pr |
 
 workflowPrompt に必ず含める事項:
-- 使用する AWS プロファイル名。各 MicroVM 実行(`pnpm run-microvm`)とマージ/PR の AWS/gh 操作を行うステップは `AWS_PROFILE=<profile>` を前置すること(フォールバック無し。未指定だと run.sh がエラーで止まる)。
-- 対象 REPO_URL と依頼内容、base(既定 main)。
-- MicroVM 実行の coder ステップは run-microvm skill を disclose_context で起動し、その手順で `pnpm run-microvm` を実行(長時間につきタイムアウトを十分長く、1800000ms 程度)、results/<requestId>/ を回収して status.json と push 先ブランチ(kiro/<requestId>)・pushedCommit を報告すること。
-- マージ・PR は手元側 coder ステップが行い、MicroVM にはやらせないこと。
-- マージ工程(lead / merge-all / fix-loop)は、統合ブランチへのマージを push した後、取り込んだ kiro/<requestId> を「作業ブランチ kiro/<requestId> の削除」の手順で origin から削除すること(`git merge-base --is-ancestor` で取り込み済みを確認してから `git push origin --delete`)。マージしなかった kiro/* は消さず報告し、残存 kiro/* の一覧を pr ステップの完了報告に載せること。
-- レビューは全並列マージ後に 1 回、Claude 中量級 + GPT 中量級 + 中量級集約。モデル ID は生きた一覧から解決(ハードコード不可)。
-- 指摘対応は常に新規ブランチで MicroVM。maxIterations 3。APPROVED でない周は pause してユーザー判断を仰ぐ。確定仕様と矛盾する指摘は rejected 理由を付けて残す。
-- 並列タスク同士はファイル重複ゼロで分割し競合を避ける。重複する共通部分は先行タスクへ寄せる。同時並列は最大 3、超過はキューイング。
-- MicroVM 実行ステップ(lead・parallel・fix-loop)は requestId を必ず報告すること。pr ステップはそれらの requestId から `results/<requestId>/status.json` の `creditsUsed` を合算し、合計を PR 本文(例: 「使用クレジット」節)と完了通知に載せること。取得不可のラン(creditsUsed が null・キー欠落・status.json 欠損)は件数を別に数え、合計に 0 として混ぜないこと。ラン別の内訳(requestId・タスク名・creditsUsed)も載せること。合算手順は下の「使用クレジットの合算」に従う。
-- 成果物の地の文は日本語。コード識別子・パス・コマンド・ブランチ名・JSON のキー/値は原文のまま。コミットは Conventional Commits 一行。
-- 各 MicroVM 実行ステップの PROMPT(分割後の各タスク指示)は run-microvm 経由で **S3** から渡るため、長い日本語のままでよい(手動の圧縮・英訳は不要)。split ステップが分割した各タスク PROMPT を日本語で詳細に書いてよく、payload の 4096 バイト制限を意識して切り詰める必要はない(run.sh が PROMPT を `<requestId>/inputs/prompt.md` へ逃がし、payload サイズを事前検証する)。
+- ラン固有の値: AWS_PROFILE、REPO_URL、依頼内容、base(既定 main)。
+- 各ステップは上表の専用エージェントを使うこと。
+- レビュー方針の要点: 全並列マージ後に 1 回、Claude 中量級 + GPT 中量級 + 中量級集約(モデル ID は生きた一覧から解決、ハードコード不可)。指摘対応は常に新規ブランチで MicroVM、maxIterations 3、APPROVED でない周は pause してユーザー判断。確定仕様と矛盾する指摘は rejected 理由を付けて残す。
+- 成果物の地の文は日本語。コミットは Conventional Commits 一行。
 
-#### 使用クレジットの合算
-
-合算対象は今回のパイプラインで実行した requestId だけであり、`pnpm runs:stats` の合計(results/ 全体、他パイプラインのランを含む)とは別物なので、パイプラインの合算には使わない。ワークスペースルートで requestId を引数に渡す:
-
-```bash
-python3 - req-AAA req-BBB req-CCC <<'PY'
-import json, math, sys
-total, missing, rows = 0, 0, []
-for rid in sys.argv[1:]:
-    try:
-        with open(f"results/{rid}/status.json", encoding="utf-8") as f:
-            c = json.load(f).get("creditsUsed")
-    except (OSError, ValueError, AttributeError):
-        c = None
-    if isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c):
-        total += c
-    else:
-        c, missing = None, missing + 1
-    rows.append((rid, c))
-print(f"total_credits={total} unavailable={missing}")
-for rid, c in rows:
-    print(f"{rid}\t{'取得不可' if c is None else c}")
-PY
-```
-
-タスク名は出力に含まれないので、requestId とタスク名の対応は各ステップの報告から補って内訳に載せる。
-
-### 3. 分割の指針(split ステップへ渡す判断基準)
-
-- **先行(共通基盤)タスク**: 複数の並列タスクが依存する土台(型定義・共通ユーティリティ・ルーティング・設定・スキーマ等)。先に入れないと並列タスクが衝突・重複するもの。無ければ先行なし。
-- **並列可能タスク**: 互いに依存せず、触るファイルが重ならないよう切る。重複が出る共通部分は先行へ寄せ、並列タスク同士のファイル重複ゼロを狙う。
-- 本質的に一枚岩で分割の旨味が無いなら分割数 1 に縮退してよい(無理に割らない)。
-- 同時並列数は最大 3。超えるならキューイングし、1 本マージして枠が空いたら次を投入。
-
-### 4. pause 時の仲介(あなた)
+### 3. pause 時の仲介(あなた)
 
 workflow が send_message(warning) で pause したら、内容に応じてユーザーに仲介する:
 
@@ -165,5 +98,5 @@ workflow が send_message(warning) で pause したら、内容に応じてユ�
 - 失敗(ok=false・push 失敗・未実行・非自明な競合)やレビュー未承認で自動的に突き進まない。必ず pause してユーザーに判断を仰ぐ。
 - 全工程を 1 つの run_workflow に収める。フェーズごとに別々の run_workflow を起動しない。
 - マージ先は常に統合ブランチ。main 直には入れない(最後は PR 経由)。
-- 順次マージで競合した場合: 軽微・機械的なら手元側 coder が解消。非自明な競合は、そのタスクを最新統合ブランチ base で MicroVM 再実行(新規ブランチ)。判断はユーザーに仰ぐ。
-- run.sh / run-microvm skill の挙動に合わせる。それらが変わったら本スキルも追従する。
+- 順次マージで競合した場合の扱いは microvm-merge の定義に従う。非自明な競合の判断はユーザーに仰ぐ。
+- run.sh / run-microvm skill の挙動に合わせる。それらが変わったら専用エージェント定義と本スキルも追従する。
