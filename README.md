@@ -16,15 +16,21 @@ GitHub リポジトリを clone してブランチを切り、Kiro が作業し�
 │  ├─ infra/                    # CDK(TypeScript)。S3x2 + IAMx2 + CfnMicrovmImage
 │  │  ├─ bin/infra.ts
 │  │  └─ lib/microvm-stack.ts
-│  └─ image/                    # MicroVM イメージの中身(code artifact)
-│     ├─ Dockerfile             # al2023-minimal + awscli + kiro-cli(musl) + Python フックサーバ
-│     ├─ hook_server.py         # /ready に 200、/run で Kiro CLI 実行 -> 成果物+status.json を S3 に put
-│     ├─ steering/              # MicroVM 内 kiro-cli 用グローバル steering(手元 Kiro IDE には無関係)
-│     └─ test_hook_server.py    # hook_server の純関数ユニットテスト
+│  ├─ image/                    # MicroVM イメージの中身(code artifact)
+│  │  ├─ Dockerfile             # al2023-minimal + awscli + kiro-cli(musl) + Python フックサーバ
+│  │  ├─ hook_server.py         # /ready に 200、/run で Kiro CLI 実行 -> 成果物+status.json を S3 に put
+│  │  ├─ steering/              # MicroVM 内 kiro-cli 用グローバル steering(手元 Kiro IDE には無関係)
+│  │  └─ test_hook_server.py    # hook_server の純関数ユニットテスト
+│  └─ runs-cli/                 # results/ 配下の run 結果を list / show / stats する Python CLI
 ├─ scripts/
 │  ├─ deploy.sh                 # Base -> zip 投入 -> Image を 1 コマンドで(pnpm deploy)
 │  ├─ package-image.sh          # packages/image を zip 化し artifact バケットへ
 │  └─ run.sh                    # run-microvm -> 結果をポーリング回収 -> terminate
+├─ .kiro/
+│  ├─ skills/                   # run-microvm(1 依頼を VM で実行)/ microvm-pipeline(分割パイプライン)
+│  └─ agents/                   # microvm-pipeline 各ステップ専用エージェント(split / run / merge / pr)
+├─ docs/
+│  └─ microvm-pipeline-agents.md # 専用エージェント化の調査メモ
 └─ README.md
 ```
 
@@ -156,6 +162,26 @@ AWS_PROFILE=work pnpm --filter infra exec cdk deploy KiroMicrovmImage \
 期待結果: `<requestId>/runs/` 配下に `status.json`・`kiro-stdout.txt`・`kiro-events.jsonl`・成果物(`weather.html` など)が出る（入力プロンプトは `<requestId>/inputs/prompt.md`）。GitHub フローでは加えて `report.json`・`report.md` が同 prefix に出る。`run.sh` は `status.json` の出現を待ち、`ok` と `exitCode`（および作業報告の有無）を表示して `results/<requestId>/` に回収する。`ksk_` で始まる文字列と GitHub PAT は CloudWatch Logs・S3 の全オブジェクト・`report.*`・`status.json`・ホスト stdout のいずれにも出ない。既存の非同期実行モデル・時間制約の単調関係（`KIRO_TIMEOUT_SECONDS(1200) < --maximum-duration(1800) < ポーリング上限(1860)`）・二段マスク設計は変更していない（GitHub フローは既存経路への追加であって置き換えではない）。
 
 kiro-cli の配布 URL や版を変えるときは、`run-microvm` が AWS 側ビルドのため build-arg 経路が無い。`packages/image/Dockerfile` の `ARG KIRO_CLI_DL_URL` 既定値を直接編集 → 手順 4(`package-image.sh`)→ 手順 5(`cdk deploy KiroMicrovmImage`)で再ビルドする。
+
+## 結果の確認（runs-cli）
+
+`run.sh` が `results/<requestId>/` に回収した結果を一覧・表示・集計する。
+
+```bash
+pnpm runs:list    # run 一覧（--ok-only などで絞り込み）
+pnpm runs:show    # 1 件の詳細
+pnpm runs:stats   # 集計（成功率、使用クレジット合計、クレジット取得不可件数）
+pnpm runs:test    # runs-cli のユニットテスト
+```
+
+## MicroVM 分割パイプライン
+
+1 つの依頼を「先行（共通基盤）タスク」と「並列タスク」に分割し、各タスクを MicroVM 上の kiro-cli で実装、統合ブランチへマージ、マルチモデルレビュー、指摘対応、PR 作成までを 1 つの `run_workflow` で実行する。
+
+- スキル: `.kiro/skills/microvm-pipeline/SKILL.md`（全体構成・レビュー方針・pause 仲介）、`.kiro/skills/run-microvm/SKILL.md`（1 依頼の実行）
+- ステップ専用エージェント: `.kiro/agents/` の `microvm-split` / `microvm-run` / `microvm-merge` / `microvm-pr`。ステップ固有ルールの一次ソース
+- 経緯と設計根拠: `docs/microvm-pipeline-agents.md`
+- PROMPT 取り違え照合: `status.json` の `promptSha256`（マスク前 prompt の SHA-256）で行う。`prompt` 本文は `mask_secrets` で `[REDACTED]` に置換されうるため照合に使わない
 
 ## 検証状況
 
