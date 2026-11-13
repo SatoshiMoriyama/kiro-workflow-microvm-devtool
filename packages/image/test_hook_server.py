@@ -439,6 +439,12 @@ class TestCreditsUsedStatusAndArtifacts(unittest.TestCase):
         self.assertIsNone(st["creditsUsed"])
         self.assertTrue(st["ok"])
 
+    def test_prompt_sha256_matches_unmasked_prompt(self):
+        import hashlib
+        st = self._status()
+        expected = hashlib.sha256(st["prompt"].encode("utf-8")).hexdigest()
+        self.assertEqual(st["promptSha256"], expected)
+
     def test_credits_value_not_rounded(self):
         st = self._status(credits_used=0.06937422736318409)
         self.assertEqual(st["creditsUsed"], 0.06937422736318409)

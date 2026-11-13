@@ -24,6 +24,7 @@ KIRO_API_KEY の値は CloudWatch Logs・S3 成果物・status.json・レスポ�
 """
 
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -268,6 +269,12 @@ def build_status(
     return {
         "requestId": request_id,
         "prompt": prompt,
+        # マスク前の prompt の SHA-256(UTF-8)。status.json 全体が mask_secrets を通るため、
+        # prompt に 40 桁 SHA 等が含まれると "prompt" は [REDACTED] で置換されうる。
+        # 手元側の取り違え照合はこちらで行う。ダイジェストはマスクパターンに掛からない。
+        "promptSha256": hashlib.sha256(
+            (prompt if isinstance(prompt, str) else "").encode("utf-8")
+        ).hexdigest(),
         "exitCode": exit_code,
         "timedOut": bool(timed_out),
         "artifacts": list(artifacts),
