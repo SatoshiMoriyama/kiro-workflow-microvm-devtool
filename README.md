@@ -169,7 +169,7 @@ kiro-cli の配布 URL や版を変えるときは、`run-microvm` が AWS 側�
 
 ```bash
 pnpm runs:list    # run 一覧（--ok-only などで絞り込み）
-pnpm runs:show    # 1 件の詳細
+pnpm runs:show -- <requestId>   # 1 件の詳細（requestId は runs:list の表示から取る）
 pnpm runs:stats   # 集計（成功率、使用クレジット合計、クレジット取得不可件数）
 pnpm runs:test    # runs-cli のユニットテスト
 ```
