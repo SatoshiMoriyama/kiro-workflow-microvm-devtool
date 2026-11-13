@@ -30,10 +30,13 @@ AWS_PROFILE=<profile> REPO_URL=<url> BASE_BRANCH=<統合ブランチ> PROMPT=<�
 
 `ok=true` でも次を確認する。
 
-- `results/<requestId>/status.json` の `prompt` が当該タスクの PROMPT と一致する。
+- `results/<requestId>/status.json` の `promptSha256` が、当該タスクの PROMPT の SHA-256 と一致する。
+  - 手元で `printf '%s' "$PROMPT" | shasum -a 256` を計算して比較する(run.sh は PROMPT を末尾改行なしで put する)。
+  - `prompt` は status.json 全体のマスクで `[REDACTED]` に置換されうるため、完全一致の照合には使わない。
 - `git fetch origin` 後、`git diff --name-only origin/<BASE_BRANCH>...origin/kiro/<requestId>` の変更ファイルが当該タスクの担当ファイル内である。
 
-不一致なら新規 requestId で再実行する。取り違えた run の `kiro/*` は消さず、報告に残す。
+不一致なら新規 requestId で 1 回だけ再実行する。取り違えた run の `kiro/*` は消さず、報告に残す。
+再実行でも `promptSha256` が不一致なら、再実行を繰り返さず `send_message`(severity `"warning"`)で報告し pause する(クレジットの浪費防止)。
 
 ## Node 系検証
 
@@ -42,7 +45,7 @@ MicroVM に Node が無いため、Node 系検証(`tsc` / `cdk synth` 等)が未
 ## 失敗時
 
 - `ok=false` / push 失敗 / `status.json` なし / 未実行(SSO 期限切れ等)は、`send_message`(severity `"warning"`)で事実を報告し pause する。
-- 自動リトライしない(照合不一致の再実行は除く)。
+- 自動リトライしない(照合不一致の 1 回限りの再実行は除く)。
 
 ## 最終メッセージ(後続ステップの入力になる)
 
