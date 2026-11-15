@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from runs_cli import config as config_mod
 
-DEFAULT_PROMPT = "札幌の天気を調べて weather.html を作って"
+DEFAULT_PROMPT = "Look up the weather in Sapporo and create weather.html"
 DEFAULT_BASE_BRANCH = "main"
 MAX_PAYLOAD_BYTES = 4096
 POLL_INTERVAL_SECONDS = 5
