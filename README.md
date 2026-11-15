@@ -42,6 +42,7 @@ These are not implemented. They are listed as constraints and future work.
 │  └─ runs-cli/     # the `kiro-microvm` Python CLI (run / list / show / stats)
 ├─ scripts/
 │  ├─ deploy.sh           # Base -> zip upload -> Image in one command (pnpm deploy)
+│  ├─ install.sh          # installs the skills and agents into ~/.kiro
 │  └─ package-image.sh    # zips packages/image and uploads it to the artifact bucket
 ├─ .kiro/
 │  ├─ skills/       # run-microvm (one request on a VM) / microvm-pipeline (split pipeline)

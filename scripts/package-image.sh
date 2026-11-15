@@ -5,11 +5,15 @@
 # 検知して再ビルドする(CLI の update-microvm-image は使わない)。
 #
 # 使い方:
-#   AWS_PROFILE=work ./scripts/package-image.sh
+#   AWS_PROFILE=<your-profile> ./scripts/package-image.sh
 set -euo pipefail
 
 REGION="${AWS_REGION:-ap-northeast-1}"
-PROFILE="${AWS_PROFILE:-work}"
+if [ -z "${AWS_PROFILE:-}" ]; then
+  echo "AWS_PROFILE is not set. Usage: AWS_PROFILE=<your-profile> ./scripts/package-image.sh" >&2
+  exit 1
+fi
+PROFILE="$AWS_PROFILE"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_DIR="$ROOT/packages/image"
