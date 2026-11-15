@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""runs_cli.loader の純関数ユニットテスト(pytest / unittest どちらでも動く)。
+"""Unit tests for runs_cli (work with both pytest and unittest).
 
-テストは一時ディレクトリ上に results/ 構造を組み立てて loader を検証する。
-loader 以外(cmd_list / cmd_show / cmd_stats)のテストは並列タスクが
-別クラス(TestCmdList / TestCmdShow / TestCmdStats)で追加するため、
-このリード部分では TestLoader のみを定義しクラス名の衝突を避ける。
+Tests build results/ layouts in temporary directories. Config, cmd_run and
+CLI contract tests live in separate files.
 """
 
 import io
@@ -13,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -72,7 +71,7 @@ class TestLoader(unittest.TestCase):
         self.assertEqual(run.prompt, "do something")
         self.assertFalse(run.broken)
         self.assertEqual(run.path, os.path.abspath(d))
-        # report.json が無いので report 由来のフィールドは None。
+        # No report.json, so the report-derived fields are None.
         self.assertIsNone(run.branch)
         self.assertIsNone(run.pushed_commit)
         self.assertIsNone(run.summary)
@@ -98,7 +97,7 @@ class TestLoader(unittest.TestCase):
     def test_report_json_absent_fields_none(self):
         d = _make_run_dir(self.results_dir, "req-1")
         _write_json(os.path.join(d, "status.json"), self._valid_status())
-        # report.json あるが一部キー欠損 -> 欠損は None。
+        # report.json exists but some keys are missing -> those are None.
         _write_json(os.path.join(d, "report.json"), {"branch": "b"})
 
         run = loader.load_runs(self.results_dir)[0]
@@ -108,7 +107,7 @@ class TestLoader(unittest.TestCase):
 
     def test_dir_without_status_is_broken(self):
         d = _make_run_dir(self.results_dir, "req-broken")
-        # status.json が無く result.txt だけある。
+        # No status.json, only result.txt.
         with open(os.path.join(d, "result.txt"), "w", encoding="utf-8") as f:
             f.write("partial output")
 
@@ -140,11 +139,11 @@ class TestLoader(unittest.TestCase):
             f.write("{ broken ")
 
         run = loader.load_runs(self.results_dir)[0]
-        # status 部分は保持される。
+        # The status part is kept.
         self.assertFalse(run.broken)
         self.assertEqual(run.request_id, "req-1")
         self.assertIs(run.ok, True)
-        # report 側のみ None。
+        # Only the report side is None.
         self.assertIsNone(run.branch)
         self.assertIsNone(run.pushed_commit)
         self.assertIsNone(run.summary)
@@ -179,7 +178,7 @@ class TestLoader(unittest.TestCase):
         self.assertEqual(loader.load_runs(missing), [])
 
     def test_non_dict_status_is_broken(self):
-        # status.json が有効 JSON だが dict でない(list/null/文字列)と broken。
+        # Valid JSON that is not a dict (list/null/string) is broken.
         for name, payload in (
             ("req-list", []),
             ("req-null", None),
@@ -195,7 +194,7 @@ class TestLoader(unittest.TestCase):
             self.assertIsNone(runs[name].ok)
 
     def test_non_dict_report_keeps_status_report_none(self):
-        # report.json が非 dict のとき status 部分は保持し report 側は None。
+        # A non-dict report.json keeps the status part; report fields are None.
         for name, payload in (
             ("req-rlist", []),
             ("req-rnull", None),
@@ -212,16 +211,16 @@ class TestLoader(unittest.TestCase):
         for name in ("req-rlist", "req-rnull", "req-rstr"):
             self.assertIn(name, runs)
             run = runs[name]
-            # status 側は保持(broken にならず ok は True)。
+            # The status side is kept (not broken, ok is True).
             self.assertFalse(run.broken, f"{name} should keep status")
             self.assertIs(run.ok, True)
-            # report 側は None。
+            # The report side is None.
             self.assertIsNone(run.branch)
             self.assertIsNone(run.pushed_commit)
             self.assertIsNone(run.summary)
 
     def test_duration_seconds_none_when_tz_mixed(self):
-        # started_at が aware、finished_at が naive(tz 混在)なら None。
+        # started_at aware and finished_at naive (mixed tz) gives None.
         d = _make_run_dir(self.results_dir, "req-tz")
         _write_json(
             os.path.join(d, "status.json"),
@@ -240,7 +239,7 @@ from runs_cli import cmd_list  # noqa: E402
 from runs_cli import cmd_stats  # noqa: E402
 
 class _Args:
-    """cmd_list.run に渡す args の最小スタブ。"""
+    """Minimal args stub for cmd_list.run."""
 
     def __init__(self, results_dir=".", ok_only=False, failed_only=False):
         self.results_dir = results_dir
@@ -250,7 +249,7 @@ class _Args:
 
 def _make_run(request_id, ok=None, exit_code=None, timed_out=None,
               artifacts=None, finished_at=None, broken=False):
-    """テスト用に Run を直接組み立てる(loader の公開フィールドを使用)。"""
+    """Build a Run directly for tests (uses the loader public fields)."""
     return loader.Run(
         request_id=request_id,
         ok=ok,
@@ -272,7 +271,7 @@ def _make_run(request_id, ok=None, exit_code=None, timed_out=None,
 
 class TestCmdList(unittest.TestCase):
     def _capture(self, runs, **arg_kwargs):
-        """cmd_list.run を実行し (exit_code, stdout, stderr) を返す。"""
+        """Run cmd_list.run and return (exit_code, stdout, stderr)."""
         out = io.StringIO()
         err = io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -280,9 +279,9 @@ class TestCmdList(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def _data_lines(self, stdout):
-        """ヘッダ行を除いたデータ行(request_id のみ先頭トークンで抽出)。"""
+        """Data rows without the header (first token = request_id)."""
         lines = [ln for ln in stdout.splitlines() if ln.strip()]
-        # 先頭はヘッダ。
+        # The first line is the header.
         return [ln.split()[0] for ln in lines[1:]]
 
     def test_header_present_and_order(self):
@@ -324,7 +323,7 @@ class TestCmdList(unittest.TestCase):
     def test_broken_displayed_as_broken(self):
         runs = [_make_run("req-broken", broken=True, finished_at=None)]
         _, out, _ = self._capture(runs)
-        # OK 列(2 番目のトークン)が broken。
+        # The OK column (second token) is "broken".
         data_line = [ln for ln in out.splitlines() if ln.strip()][1]
         self.assertEqual(data_line.split()[1], "broken")
 
@@ -350,7 +349,7 @@ class TestCmdList(unittest.TestCase):
                       finished_at="2026-11-01T10:00:00+00:00"),
         ]
         _, out, _ = self._capture(runs, failed_only=True)
-        # broken は failed に含める方針。降順で fail-run, broken-run の順。
+        # broken counts as failed. Descending order: fail-run, broken-run.
         self.assertEqual(self._data_lines(out), ["fail-run", "broken-run"])
 
     def test_both_filters_is_error(self):
@@ -381,20 +380,21 @@ class TestCmdList(unittest.TestCase):
 
 
 class _ShowArgs:
-    """argparse.Namespace 相当の簡易 args(cmd_show.run に渡す)。"""
+    """Simple args like argparse.Namespace (passed to cmd_show.run)."""
 
-    def __init__(self, request_id, results_dir=None):
+    def __init__(self, request_id, results_dir=None, json=False):
         self.request_id = request_id
         self.results_dir = results_dir
+        self.json = json
 
 
 class TestCmdShow(unittest.TestCase):
-    """cmd_show.run の振る舞いを検証する(TestLoader とは独立)。"""
+    """Behavior of cmd_show.run (independent of TestLoader)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.results_dir = self._tmp.name
-        # cmd_show を遅延 import(loader 以外のモジュール依存を局所化)。
+        # Import cmd_show lazily to keep module dependencies local.
         from runs_cli import cmd_show  # noqa: E402
 
         self.cmd_show = cmd_show
@@ -430,17 +430,14 @@ class TestCmdShow(unittest.TestCase):
         return d
 
     def _run_show(self, request_id):
-        """cmd_show.run を実行し (exit_code, stdout) を返す。"""
+        """Run cmd_show.run and return (exit_code, stdout)."""
         runs = loader.load_runs(self.results_dir)
         args = _ShowArgs(request_id=request_id, results_dir=self.results_dir)
         buf = io.StringIO()
-        old = sys.stdout
-        try:
-            sys.stdout = buf
+        err = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
             code = self.cmd_show.run(runs, args)
-        finally:
-            sys.stdout = old
-        return code, buf.getvalue()
+        return code, buf.getvalue() + err.getvalue()
 
     def test_exact_match_displays(self):
         self._make_run("req-alpha-123")
@@ -455,20 +452,20 @@ class TestCmdShow(unittest.TestCase):
     def test_prefix_shortened_match(self):
         self._make_run("req-alpha-123")
         self._make_run("req-beta-999")
-        # "req-alpha" は req-alpha-123 のみに前方一致する。
+        # "req-alpha" is a prefix of req-alpha-123 only.
         code, out = self._run_show("req-alpha")
         self.assertEqual(code, 0)
         self.assertIn("requestId: req-alpha-123", out)
 
     def test_exact_preferred_over_prefix(self):
-        # "req-1" が完全一致で存在し、"req-12" も前方一致で存在するケース。
+        # "req-1" exists exactly and "req-12" also matches as a prefix.
         self._make_run("req-1")
         self._make_run("req-12")
         code, out = self._run_show("req-1")
         self.assertEqual(code, 0)
         self.assertIn("requestId: req-1", out)
-        # 完全一致を優先するので候補列挙にはならない。
-        self.assertNotIn("候補", out)
+        # The exact match wins, so no candidate list is printed.
+        self.assertNotIn("Candidates", out)
 
     def test_multiple_prefix_matches_list_candidates(self):
         self._make_run("req-alpha-1")
@@ -487,14 +484,14 @@ class TestCmdShow(unittest.TestCase):
     def test_report_md_appended(self):
         self._make_run(
             "req-alpha-123",
-            report_md="# レポート本文\nこれは report.md の中身です。\n",
+            report_md="# Report body\nThis is the report.md content.\n",
         )
         code, out = self._run_show("req-alpha-123")
         self.assertEqual(code, 0)
-        self.assertIn("# レポート本文", out)
-        self.assertIn("これは report.md の中身です。", out)
-        # report.md はフィールド表示の末尾に出る。
-        self.assertLess(out.index("requestId:"), out.index("# レポート本文"))
+        self.assertIn("# Report body", out)
+        self.assertIn("This is the report.md content.", out)
+        # report.md comes after the fields.
+        self.assertLess(out.index("requestId:"), out.index("# Report body"))
 
     def test_report_md_absent_not_printed(self):
         self._make_run("req-alpha-123")
@@ -512,19 +509,19 @@ class TestCmdShow(unittest.TestCase):
         self.assertIn("req-broken", out)
 
     def test_broken_run_with_report_md_appended(self):
-        # broken な run でも report.md があれば末尾に出す。
+        # Even a broken run prints report.md when it exists.
         d = _make_run_dir(self.results_dir, "req-broken-md")
         with open(os.path.join(d, "status.json"), "w", encoding="utf-8") as f:
             f.write("{ not valid json ")
         with open(os.path.join(d, "report.md"), "w", encoding="utf-8") as f:
-            f.write("# 壊れ run のレポート\n途中結果の本文。\n")
+            f.write("# Report of a broken run\nPartial result body.\n")
         code, out = self._run_show("req-broken-md")
         self.assertEqual(code, 0)
         self.assertIn("broken", out)
         self.assertIn("--- report.md ---", out)
-        self.assertIn("# 壊れ run のレポート", out)
-        self.assertIn("途中結果の本文。", out)
-        # broken 表示の後に report.md が出る。
+        self.assertIn("# Report of a broken run", out)
+        self.assertIn("Partial result body.", out)
+        # report.md comes after the broken notice.
         self.assertLess(out.index("broken"), out.index("--- report.md ---"))
 
     def test_report_fields_from_report_json(self):
@@ -539,11 +536,11 @@ class TestCmdShow(unittest.TestCase):
 
 
 class TestCmdStats(unittest.TestCase):
-    """cmd_stats.run の集計・整形・JSON 出力を検証する(別クラス)。"""
+    """Aggregation, formatting and JSON output of cmd_stats.run."""
 
     def _run(self, request_id, ok=None, broken=False, started=None, finished=None,
              credits_used=None):
-        """テスト用に Run を直接組む小ヘルパ。"""
+        """Small helper that builds a Run directly."""
         return loader.Run(
             request_id=request_id,
             ok=ok,
@@ -564,14 +561,14 @@ class TestCmdStats(unittest.TestCase):
         )
 
     def _make_runs(self):
-        # 構成:
-        # - ok=True, duration 10 秒
-        # - ok=True, duration 20 秒
-        # - ok=False(失敗), duration 算出不可
-        # - broken=True(壊れ), duration 算出不可
-        # 合計 4 run / 成功 2 / 失敗 1 / 壊れ 1。
-        # 成功率の分母は全 run = 4 -> 2/4 = 50.0%。
-        # 平均実行時間は算出可の 2 run のみ -> (10+20)/2 = 15.0 秒。
+        # Layout:
+        # - ok=True, duration 10 s
+        # - ok=True, duration 20 s
+        # - ok=False (failed), duration unavailable
+        # - broken=True, duration unavailable
+        # 4 runs in total: 2 ok / 1 failed / 1 broken.
+        # The success rate denominator is all runs (4): 2/4 = 50.0%.
+        # The average covers the 2 runs with a duration: (10+20)/2 = 15.0 s.
         return [
             self._run(
                 "req-ok-1",
@@ -611,9 +608,9 @@ class TestCmdStats(unittest.TestCase):
         self.assertEqual(data["ok"], 2)
         self.assertEqual(data["failed"], 1)
         self.assertEqual(data["broken"], 1)
-        # 分母は全 run(4): 2/4 = 50.0%。
+        # Denominator is all runs (4): 2/4 = 50.0%.
         self.assertEqual(data["successRate"], 50.0)
-        # 算出可の 2 run のみで平均: (10+20)/2 = 15.0 秒。
+        # Average over the 2 runs with a duration: (10+20)/2 = 15.0 s.
         self.assertEqual(data["avgDurationSeconds"], 15.0)
 
     def test_json_expected_keys(self):
@@ -636,7 +633,7 @@ class TestCmdStats(unittest.TestCase):
         self.assertEqual(data["ok"], 0)
         self.assertEqual(data["failed"], 0)
         self.assertEqual(data["broken"], 0)
-        # 総数 0 のとき成功率・平均は None 相当。
+        # With no runs, success rate and average are None.
         self.assertIsNone(data["successRate"])
         self.assertIsNone(data["avgDurationSeconds"])
 
@@ -644,8 +641,8 @@ class TestCmdStats(unittest.TestCase):
         runs = self._make_runs()
         rc, out = self._capture(runs, self._Args(json=False))
         self.assertEqual(rc, 0)
-        # 人間向け表示に主要な数値ラベルが含まれる。
-        self.assertIn("総 run 数", out)
+        # The human output contains the main labels.
+        self.assertIn("Total runs", out)
         self.assertIn("4", out)
         self.assertIn("50.0%", out)
         self.assertIn("15.0", out)
@@ -653,16 +650,16 @@ class TestCmdStats(unittest.TestCase):
     def test_human_output_na_when_empty(self):
         rc, out = self._capture([], self._Args(json=False))
         self.assertEqual(rc, 0)
-        # 0 件のとき成功率・平均は N/A 表示。
+        # With no runs, success rate and average show N/A.
         self.assertIn("N/A", out)
 
     def test_total_equals_ok_plus_failed_plus_broken(self):
-        # ok=None かつ非 broken の run を含めても
-        # total == ok + failed + broken が常に成立する。
+        # Even with a non-broken run whose ok is None,
+        # total == ok + failed + broken holds.
         runs = [
             self._run("req-ok", ok=True),
             self._run("req-false", ok=False),
-            self._run("req-none", ok=None),       # 非 broken・ok None -> failed
+            self._run("req-none", ok=None),       # non-broken, ok None -> failed
             self._run("req-broken", ok=None, broken=True),
         ]
         rc, out = self._capture(runs, self._Args(json=True))
@@ -681,7 +678,7 @@ class TestCmdStats(unittest.TestCase):
             self._run("c1", ok=True, credits_used=1.5),
             self._run("c2", ok=False, credits_used=2.25),
             self._run("c3", ok=True),                      # None
-            self._run("c4", broken=True),                  # broken も None
+            self._run("c4", broken=True),                  # broken is also None
         ]
         _, out = self._capture(runs, self._Args(json=True))
         data = json.loads(out)
@@ -696,8 +693,8 @@ class TestCmdStats(unittest.TestCase):
         self.assertIsNone(data["creditsTotal"])
         self.assertEqual(data["creditsUnavailable"], 2)
         _, human = self._capture(runs, self._Args(json=False))
-        self.assertIn("クレジット合計", human)
-        self.assertIn("取得不可 2 件", human)
+        self.assertIn("Credits total", human)
+        self.assertIn("2 unavailable", human)
         self.assertIn("N/A", human)
 
     def test_credits_empty_runs(self):
@@ -710,13 +707,13 @@ class TestCmdStats(unittest.TestCase):
         runs = [self._run("h1", ok=True, credits_used=0.5),
                 self._run("h2", ok=True)]
         _, out = self._capture(runs, self._Args(json=False))
-        self.assertIn("クレジット合計", out)
+        self.assertIn("Credits total", out)
         self.assertIn("0.5 credits", out)
-        self.assertIn("取得不可 1 件", out)
+        self.assertIn("1 unavailable", out)
 
 
 class TestLoaderCredits(unittest.TestCase):
-    """loader が status.json の creditsUsed を credits_used へ読む挙動を検証する。"""
+    """The loader maps creditsUsed in status.json to credits_used."""
 
     def _load_one(self, status_extra, key_present=True, value=None):
         with tempfile.TemporaryDirectory() as tmp:
@@ -749,14 +746,14 @@ class TestLoaderCredits(unittest.TestCase):
 
     def test_broken_run_is_none(self):
         with tempfile.TemporaryDirectory() as tmp:
-            _make_run_dir(tmp, "req-b")  # status.json 無し -> broken
+            _make_run_dir(tmp, "req-b")  # no status.json -> broken
             runs = loader.load_runs(tmp)
         self.assertTrue(runs[0].broken)
         self.assertIsNone(runs[0].credits_used)
 
 
 class TestMainDispatch(unittest.TestCase):
-    """runs_cli.__main__.main(argv) 経由のディスパッチを検証する。"""
+    """Dispatch through runs_cli.__main__.main(argv)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -808,6 +805,94 @@ class TestMainDispatch(unittest.TestCase):
         self.assertEqual(code, 0)
         data = json.loads(out)
         self.assertEqual(data["total"], 1)
+
+
+class TestJsonAndDefaultDir(unittest.TestCase):
+    """--json output of show/list and the default results directory."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.results_dir = self._tmp.name
+        d = _make_run_dir(self.results_dir, "req-j-1")
+        _write_json(os.path.join(d, "status.json"), {
+            "requestId": "req-j-1", "ok": True, "exitCode": 0,
+            "creditsUsed": 1.5,
+            "startedAt": "2026-11-04T20:00:00+00:00",
+            "finishedAt": "2026-11-04T20:00:10+00:00",
+        })
+        _write_json(os.path.join(d, "report.json"), {
+            "branch": "kiro/x", "pushedCommit": "abc", "summary": "did it",
+        })
+        from runs_cli import __main__ as main_mod
+
+        self.main = main_mod.main
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run_main(self, argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = self.main(argv)
+        return code, buf.getvalue()
+
+    def test_show_json_fields(self):
+        code, out = self._run_main(
+            ["show", "req-j-1", "--json", "--results-dir", self.results_dir]
+        )
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(
+            set(data.keys()),
+            {"requestId", "ok", "exitCode", "creditsUsed", "branch",
+             "pushedCommit", "path", "startedAt", "finishedAt", "summary"},
+        )
+        self.assertEqual(data["requestId"], "req-j-1")
+        self.assertIs(data["ok"], True)
+        self.assertEqual(data["creditsUsed"], 1.5)
+        self.assertEqual(data["branch"], "kiro/x")
+        self.assertEqual(data["summary"], "did it")
+
+    def test_list_json(self):
+        code, out = self._run_main(
+            ["list", "--json", "--results-dir", self.results_dir]
+        )
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual([r["requestId"] for r in data], ["req-j-1"])
+
+    def test_results_dir_option_expands_tilde(self):
+        home = os.path.dirname(self.results_dir)
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            code, out = self._run_main(
+                ["list", "--json", "--results-dir", "~/" + os.path.basename(self.results_dir)]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(json.loads(out)), 1)
+
+    def test_default_results_dir_from_env(self):
+        with mock.patch.dict(os.environ, {"KIRO_MICROVM_RESULTS_DIR": self.results_dir}):
+            self.assertEqual(loader.default_results_dir(), os.path.abspath(self.results_dir))
+            code, out = self._run_main(["list", "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(json.loads(out)), 1)
+
+    def test_default_results_dir_is_not_repo_relative(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("KIRO_MICROVM_RESULTS_DIR", "XDG_DATA_HOME")}
+        env["XDG_CONFIG_HOME"] = self.results_dir  # no config file there
+        with mock.patch.dict(os.environ, env, clear=True):
+            path = loader.default_results_dir()
+        self.assertTrue(path.endswith(os.path.join(".local", "share", "kiro-microvm", "results")))
+
+    def test_default_results_dir_honors_xdg_data_home(self):
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": "/x/data"}):
+            os.environ.pop("KIRO_MICROVM_RESULTS_DIR", None)
+            os.environ["XDG_CONFIG_HOME"] = self.results_dir
+            self.assertEqual(
+                loader.default_results_dir(),
+                os.path.join("/x/data", "kiro-microvm", "results"),
+            )
 
 
 if __name__ == "__main__":

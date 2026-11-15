@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
-"""show サブコマンド: 指定した run の詳細を表示する。
+"""show subcommand: print the details of one run.
 
-__main__.py から cmd_show.run(runs, args) で呼ばれる。
-args.request_id(位置引数)で run を 1 件特定し、整形表示する。
-特定は完全一致を最優先し、無ければ requestId の前方一致(短縮指定)で解決する。
+Called from __main__.py as cmd_show.run(runs, args). args.request_id selects
+the run: an exact match wins, otherwise a unique requestId prefix is accepted.
+With --json the details are printed as one JSON object.
 
-公開 API(loader.Run / load_runs など)は並列タスクとの契約のため参照のみ行い変更しない。
+The public loader API (loader.Run / load_runs) is only read, never changed.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
 
 def _resolve_run(runs, request_id):
-    """request_id から run を 1 件解決する。
+    """Resolve one run from request_id. Returns (run, matches).
 
-    戻り値は (run, matches)。
-    - 完全一致が 1 件あればそれを最優先で返す(matches は [run])。
-    - 完全一致が無く前方一致が 1 件ならそれを返す。
-    - 前方一致が複数なら run は None、matches に候補一覧を入れる。
-    - 該当なしなら run は None、matches は空。
+    - A single exact match wins (matches is [run]).
+    - Otherwise a single prefix match is returned.
+    - Several prefix matches give run=None and the candidates in matches.
+    - No match gives run=None and an empty matches list.
     """
     exact = [r for r in runs if r.request_id == request_id]
     if len(exact) == 1:
         return exact[0], exact
     if len(exact) > 1:
-        # requestId は本来一意だが、万一重複していれば候補列挙にフォールバックする。
+        # requestId should be unique; if not, fall back to listing candidates.
         return None, exact
 
     prefix = [r for r in runs if r.request_id.startswith(request_id)]
@@ -37,12 +37,12 @@ def _resolve_run(runs, request_id):
 
 
 def _format_ok(run) -> str:
-    """ok を exit_code / timed_out 併記で文字列化する。"""
+    """Format ok together with exit_code and timed_out."""
     return f"{run.ok} (exit_code={run.exit_code}, timed_out={run.timed_out})"
 
 
 def _read_report_md(run):
-    """run.path 直下に report.md があれば中身を返す。無ければ None。"""
+    """Return the contents of report.md in the run directory, or None."""
     report_path = os.path.join(run.path, "report.md")
     if not os.path.isfile(report_path):
         return None
@@ -53,21 +53,24 @@ def _read_report_md(run):
         return None
 
 
+def _print_report_md(report_md, out) -> None:
+    print("", file=out)
+    print("--- report.md ---", file=out)
+    out.write(report_md)
+    if not report_md.endswith("\n"):
+        out.write("\n")
+
+
 def _print_run(run, out) -> None:
-    """特定した run を整形して out に表示する。"""
+    """Print one run in human-readable form."""
     if run.broken:
-        # broken な run は読めるフィールドだけ出す。
-        print("broken: この run は status.json が欠損/破損しています", file=out)
+        # A broken run only has a few readable fields.
+        print("broken: status.json of this run is missing or corrupt", file=out)
         print(f"requestId: {run.request_id}", file=out)
         print(f"path: {run.path}", file=out)
-        # broken でも report.md があれば末尾に出す。
         report_md = _read_report_md(run)
         if report_md is not None:
-            print("", file=out)
-            print("--- report.md ---", file=out)
-            out.write(report_md)
-            if not report_md.endswith("\n"):
-                out.write("\n")
+            _print_report_md(report_md, out)
         return
 
     print(f"requestId: {run.request_id}", file=out)
@@ -81,38 +84,49 @@ def _print_run(run, out) -> None:
         for a in run.artifacts:
             print(f"  - {a}", file=out)
     else:
-        print("  (なし)", file=out)
+        print("  (none)", file=out)
 
     report_md = _read_report_md(run)
     if report_md is not None:
-        print("", file=out)
-        print("--- report.md ---", file=out)
-        # report.md の中身はそのまま出力する。
-        out.write(report_md)
-        if not report_md.endswith("\n"):
-            out.write("\n")
+        _print_report_md(report_md, out)
+
+
+def _to_dict(run) -> dict:
+    """JSON form of one run for `show --json`."""
+    return {
+        "requestId": run.request_id,
+        "ok": run.ok,
+        "exitCode": run.exit_code,
+        "creditsUsed": run.credits_used,
+        "branch": run.branch,
+        "pushedCommit": run.pushed_commit,
+        "path": run.path,
+        "startedAt": run.started_at,
+        "finishedAt": run.finished_at,
+        "summary": run.summary,
+    }
 
 
 def run(runs, args) -> int:
-    """show サブコマンドの本体。正常終了で 0、該当なし/複数一致で 0 以外を返す。"""
+    """Body of the show subcommand. Returns 0, or non-zero on no/ambiguous match."""
     out = sys.stdout
+    err = sys.stderr
     request_id = args.request_id
 
     target, matches = _resolve_run(runs, request_id)
 
     if target is None:
         if matches:
-            # 前方一致(または重複)が複数: 候補を列挙して異常終了。
-            print(
-                f"'{request_id}' に一致する run が複数あります。候補:",
-                file=out,
-            )
+            print(f"Multiple runs match '{request_id}'. Candidates:", file=err)
             for r in matches:
-                print(f"  - {r.request_id}", file=out)
+                print(f"  - {r.request_id}", file=err)
             return 1
-        # 該当なし。
-        print(f"'{request_id}' に一致する run が見つかりませんでした", file=out)
+        print(f"No run found matching '{request_id}'", file=err)
         return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(_to_dict(target), ensure_ascii=False), file=out)
+        return 0
 
     _print_run(target, out)
     return 0

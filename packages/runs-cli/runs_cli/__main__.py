@@ -1,60 +1,67 @@
 #!/usr/bin/env python3
-"""runs-cli のエントリポイント。
-
-list / show / stats のサブコマンドを argparse でディスパッチする薄い骨組み。
-各サブコマンドの実装(cmd_list / cmd_show / cmd_stats)は並列タスクが追加するため、
-ここでは選択された分岐内で遅延 import する(未作成モジュールを top-level import しない)。
-"""
+"""Entry point of the kiro-microvm CLI (run / list / show / stats)."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 
-from runs_cli import loader
+from runs_cli import config, loader
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="runs",
-        description="run 結果(results/ 配下)を一覧・表示・集計する CLI",
+        prog="kiro-microvm",
+        description="Run Kiro CLI on a Lambda MicroVM and inspect past runs.",
     )
 
-    # 全サブコマンド共通の親パーサ。--results-dir を共有する。
+    # Shared by all subcommands.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--results-dir",
-        default=loader.default_results_dir(),
-        help="results ディレクトリのパス(デフォルト: リポジトリルートの results/)",
+        default=None,
+        help="results directory (default: $KIRO_MICROVM_RESULTS_DIR, "
+        "then ~/.local/share/kiro-microvm/results)",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # list サブコマンド
-    p_list = subparsers.add_parser(
-        "list", parents=[common], help="run を一覧表示する"
+    p_run = subparsers.add_parser(
+        "run",
+        parents=[common],
+        help="start a MicroVM run and fetch its results",
+        description="Start a MicroVM, wait for the result on S3 and download it. "
+        "Progress goes to stderr. The exit code is 0 even if the run itself "
+        "failed (ok=false); check the result.",
     )
+    p_run.add_argument(
+        "prompt", nargs="?", default=None,
+        help="prompt text (or PROMPT env var; default: a sample prompt)",
+    )
+    p_run.add_argument("--repo-url", help="GitHub repo to clone (or REPO_URL env var)")
+    p_run.add_argument("--base-branch", help="base branch (or BASE_BRANCH env var; default: main)")
+    p_run.add_argument("--request-id", help="request ID (or REQUEST_ID env var; default: generated)")
+    p_run.add_argument("--profile", help="AWS profile (overrides AWS_PROFILE)")
+    p_run.add_argument("--region", help="AWS region (overrides AWS_REGION; default: ap-northeast-1)")
+    p_run.add_argument("--stack-name", help="CloudFormation stack (overrides STACK_NAME)")
+    p_run.add_argument("--image-name", help="MicroVM image name (overrides MICROVM_IMAGE_NAME)")
+    p_run.add_argument(
+        "--json", action="store_true",
+        help="print a final JSON line: requestId, resultsDir, ok, exitCode, microvmId",
+    )
+
+    p_list = subparsers.add_parser("list", parents=[common], help="list runs")
     group = p_list.add_mutually_exclusive_group()
-    group.add_argument(
-        "--ok-only", action="store_true", help="成功(ok)の run のみ表示する"
-    )
-    group.add_argument(
-        "--failed-only", action="store_true", help="失敗した run のみ表示する"
-    )
+    group.add_argument("--ok-only", action="store_true", help="show only successful runs")
+    group.add_argument("--failed-only", action="store_true", help="show only failed or broken runs")
+    p_list.add_argument("--json", action="store_true", help="output JSON")
 
-    # show サブコマンド
-    p_show = subparsers.add_parser(
-        "show", parents=[common], help="指定した run の詳細を表示する"
-    )
-    p_show.add_argument("request_id", help="表示する run の requestId")
+    p_show = subparsers.add_parser("show", parents=[common], help="show details of a run")
+    p_show.add_argument("request_id", help="requestId of the run (a unique prefix also works)")
+    p_show.add_argument("--json", action="store_true", help="output JSON")
 
-    # stats サブコマンド
-    p_stats = subparsers.add_parser(
-        "stats", parents=[common], help="run の集計統計を表示する"
-    )
-    p_stats.add_argument(
-        "--json", action="store_true", help="集計結果を JSON で出力する"
-    )
+    p_stats = subparsers.add_parser("stats", parents=[common], help="show aggregate statistics")
+    p_stats.add_argument("--json", action="store_true", help="output JSON")
 
     return parser
 
@@ -63,9 +70,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    runs = loader.load_runs(args.results_dir)
+    if args.command == "run":
+        from runs_cli import cmd_run
 
-    # cmd_*.py は並列タスクが追加する。top-level import は失敗するため遅延 import する。
+        return cmd_run.run(args)
+
+    results_dir = config.resolve(
+        {"KIRO_MICROVM_RESULTS_DIR": args.results_dir}
+    ).results_dir
+    runs = loader.load_runs(results_dir)
+
+    # Lazy imports keep startup cheap.
     if args.command == "list":
         from runs_cli import cmd_list
 

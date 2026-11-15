@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""runs list サブコマンドの実装。
+"""list subcommand.
 
-loader が返す Run のリストを受け取り、固定幅の表として標準出力へ一覧表示する。
-標準ライブラリのみを使用する(loader との契約はフィールド名でのみ依存)。
+Prints the runs returned by the loader as a fixed-width table, or as JSON
+with --json. Only the standard library is used.
 
-OK 列の意味と failed フィルタの扱い(本実装で固定する方針):
-- run.broken が True の run は「broken」と表示し、「失敗(failed)」側に含める。
-  broken は status.json を読めなかった run であり、成功(ok=True)ではないため。
-- --ok-only は ok が True の run のみ(broken は除外)。
-- --failed-only は ok が False または broken の run のみ。
-- --ok-only と --failed-only の同時指定は不可(エラーとして exit code 2 を返す)。
-  argparse 側(__main__)でも排他になっているが、ここでも防御的に判定する。
+Semantics of the OK column and the failed filter:
+- A run with broken=True is shown as "broken" and counts as failed, because
+  its status.json could not be read and so it is not a success.
+- --ok-only keeps runs with ok=True (broken excluded).
+- --failed-only keeps runs with ok=False or broken.
+- --ok-only and --failed-only together are an error (exit code 2). argparse
+  already makes them exclusive; run() checks again defensively.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import datetime
 
-# ヘッダ(原文英大文字)。列順もこの順で固定する。
+# Column headers; the column order is fixed.
 _HEADERS = ["REQUEST_ID", "OK", "EXIT", "TIMED_OUT", "ARTIFACTS", "WHEN"]
 
-# ARTIFACTS 列で表示する最大件数。これを超える分は "…" に省略する。
+# Max artifacts shown in the ARTIFACTS column; the rest becomes "…".
 _MAX_ARTIFACTS = 3
 
 
 def _parse_finished(value):
-    """finished_at(ISO8601 文字列)を datetime へ変換する。欠損/解釈不能は None。"""
+    """Parse finished_at (ISO8601 string) into a datetime. Missing/unparsable gives None."""
     if not value:
         return None
     try:
@@ -36,22 +37,22 @@ def _parse_finished(value):
 
 
 def _sort_key(run):
-    """finished_at 降順、欠損(解釈不能含む)は末尾へ回すためのソートキー。
+    """Sort key: finished_at descending, missing/unparsable last.
 
-    sorted(reverse=True) 前提で (有効フラグ, datetime) のタプルを返す。
-    欠損は有効フラグ 0 + datetime.min とし、降順でも必ず末尾に来るようにする。
+    Meant for sorted(reverse=True); returns (valid flag, datetime). A missing
+    value gets flag 0 and datetime.min so it always ends up last.
     """
     dt = _parse_finished(run.finished_at)
     if dt is None:
         return (0, datetime.min)
-    # tz-aware / naive が混在すると比較で例外になるため naive へ正規化する。
+    # Mixed tz-aware/naive values cannot be compared, so normalize to naive.
     if dt.tzinfo is not None:
         dt = dt.astimezone().replace(tzinfo=None)
     return (1, dt)
 
 
 def _format_ok(run) -> str:
-    """OK 列の表示文字列を返す。"""
+    """Return the text for the OK column."""
     if run.broken:
         return "broken"
     if run.ok is True:
@@ -62,14 +63,14 @@ def _format_ok(run) -> str:
 
 
 def _format_exit(run) -> str:
-    """EXIT 列。exit_code が None なら '-'。"""
+    """EXIT column; '-' when exit_code is None."""
     if run.exit_code is None:
         return "-"
     return str(run.exit_code)
 
 
 def _format_timed_out(run) -> str:
-    """TIMED_OUT 列。None なら '-'。"""
+    """TIMED_OUT column; '-' when None."""
     if run.timed_out is True:
         return "true"
     if run.timed_out is False:
@@ -78,7 +79,7 @@ def _format_timed_out(run) -> str:
 
 
 def _format_artifacts(run) -> str:
-    """ARTIFACTS 列。カンマ区切り、長ければ先頭数個 + '…'。"""
+    """ARTIFACTS column: comma separated; long lists are cut with '…'."""
     artifacts = run.artifacts or []
     if not artifacts:
         return "-"
@@ -89,7 +90,7 @@ def _format_artifacts(run) -> str:
 
 
 def _format_when(run) -> str:
-    """WHEN 列。finished_at をローカル時刻へ整形する。欠損/解釈不能は '-'。"""
+    """WHEN column: finished_at in local time; '-' if missing/unparsable."""
     dt = _parse_finished(run.finished_at)
     if dt is None:
         return "-"
@@ -99,7 +100,7 @@ def _format_when(run) -> str:
 
 
 def _passes_filter(run, ok_only: bool, failed_only: bool) -> bool:
-    """フィルタ条件を満たすか判定する。"""
+    """Return whether the run passes the filter."""
     if ok_only:
         return run.ok is True and not run.broken
     if failed_only:
@@ -107,23 +108,42 @@ def _passes_filter(run, ok_only: bool, failed_only: bool) -> bool:
     return True
 
 
+def _to_dict(run) -> dict:
+    """JSON form of one run for `list --json`."""
+    return {
+        "requestId": run.request_id,
+        "ok": run.ok,
+        "exitCode": run.exit_code,
+        "timedOut": run.timed_out,
+        "broken": run.broken,
+        "artifacts": run.artifacts,
+        "startedAt": run.started_at,
+        "finishedAt": run.finished_at,
+        "path": run.path,
+    }
+
+
 def run(runs, args) -> int:
-    """list サブコマンドのエントリポイント。正常終了で 0 を返す。"""
+    """Entry point of the list subcommand. Returns 0 on success."""
     ok_only = bool(getattr(args, "ok_only", False))
     failed_only = bool(getattr(args, "failed_only", False))
 
-    # 両方同時指定は不可。防御的にエラーを返す。
+    # Both filters at once is not allowed.
     if ok_only and failed_only:
         print(
-            "エラー: --ok-only と --failed-only は同時に指定できません。",
+            "error: --ok-only and --failed-only cannot be used together.",
             file=sys.stderr,
         )
         return 2
 
     filtered = [r for r in runs if _passes_filter(r, ok_only, failed_only)]
 
-    # finished_at 降順、欠損は末尾。
+    # finished_at descending, missing last.
     ordered = sorted(filtered, key=_sort_key, reverse=True)
+
+    if getattr(args, "json", False):
+        print(json.dumps([_to_dict(r) for r in ordered], ensure_ascii=False))
+        return 0
 
     rows = []
     for r in ordered:
@@ -138,7 +158,7 @@ def run(runs, args) -> int:
             ]
         )
 
-    # 固定幅: 各列はヘッダと全セルの最大幅に揃える。
+    # Fixed width: each column is as wide as its header and widest cell.
     widths = [len(h) for h in _HEADERS]
     for row in rows:
         for i, cell in enumerate(row):

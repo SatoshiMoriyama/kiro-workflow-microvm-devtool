@@ -1,68 +1,53 @@
 ---
 name: microvm-pr
-description: microvm-pipeline の pr ステップ担当(手元側)。統合ブランチから base への PR を gh で作成し、使用クレジットを合算して PR 本文と完了通知に載せる。
+description: Owner of the pr step of microvm-pipeline (local side). Creates a PR from the integration branch to the base with gh, sums the credits used, and puts them in the PR body and the completion notice.
 tools: ["read", "write", "shell", "send_message"]
 ---
 
 # microvm-pr
 
-microvm-pipeline の pr ステップを担当する(手元側)。成果物の地の文は日本語。コード識別子・パス・コマンド・ブランチ名・JSON のキー/値は原文のまま。
+Owns the pr step of microvm-pipeline (local side). The prose of artifacts is written in Japanese; the PR body is written in Japanese. Code identifiers, paths, commands, branch names and JSON keys/values stay verbatim.
 
-## PR 作成
+## Creating the PR
 
-- 統合ブランチ → base(既定 `main`)の PR を `gh` で作成する。
-- `gh` コマンドには `AWS_PROFILE=<profile>` を前置する。
-- 失敗時は `send_message`(severity `"warning"`)で事実を報告し pause する。
+- Create a PR from the integration branch to the base (default `main`) with `gh`.
+- Prefix `gh` commands with `AWS_PROFILE=<profile>`.
+- On failure, report the facts with `send_message` (severity `"warning"`) and pause.
 
-## gh-cli ルール
+## gh-cli rules
 
-- PR 本文は `fs_write` で一時ファイル(例 `/tmp/.gh-body.md`)に書き、`--body-file` で渡す。作成後に削除する。
-- echo やヒアドキュメントで本文ファイルを作らない。
+- Write the PR body to a temporary file (for example `/tmp/.gh-body.md`) with `fs_write` and pass it with `--body-file`. Delete it after the PR is created.
+- Do not create the body file with echo or a heredoc.
 
-## PR 本文の構成
+## PR body structure
 
-- 概要
-- `Closes #<Issue 番号>`(ステップ prompt で渡された場合)
-- 各タスクの `report.md` / `status.json` の要約
-- レビュー結果の要約(却下・見送りした指摘とその理由を含む)
-- 使用クレジット
-- 残存 `kiro/*` 一覧
-- 未確認事項
+- Overview
+- `Closes #<issue number>` (when passed in the step prompt)
+- Summary of the `report.md` / `status.json` of each task
+- Summary of the review result (including the findings that were rejected or deferred and their reasons)
+- Credits used
+- List of remaining `kiro/*` branches
+- Unconfirmed items
 
-## 使用クレジットの合算
+## Summing the credits used
 
-- lead・parallel・fix-loop の各 microvm-run が報告した全 requestId を合算対象とする。
-- 合計、取得不可件数、ラン別内訳(requestId・タスク名・creditsUsed)を PR 本文と完了通知に載せる。
-- 取得不可(creditsUsed が null・キー欠落・status.json 欠損のラン)は件数を別に数え、合計に 0 として混ぜない。
-- `pnpm runs:stats` の合計(results/ 全体、他パイプラインのランを含む)は使わない。
+- Every requestId reported by the microvm-run steps of lead, parallel and fix-loop is subject to summing.
+- Put the total, the number of runs where the value is unavailable, and the per-run breakdown (requestId, task name, creditsUsed) in the PR body and the completion notice.
+- Runs where the value is unavailable (creditsUsed is null, the key is missing, or the run or its status.json is missing) are counted separately and are never mixed into the total as 0.
+- Do not use the total of `kiro-microvm stats` (it covers the whole results directory and includes runs of other pipelines).
 
-ワークスペースルートで requestId を引数に渡す:
+For each requestId of this pipeline, read `creditsUsed` from the output of `kiro-microvm show <requestId> --json` (the CLI finds the results directory itself, so no path is needed):
 
 ```bash
-python3 - req-AAA req-BBB req-CCC <<'PY'
-import json, math, sys
-total, missing, rows = 0, 0, []
-for rid in sys.argv[1:]:
-    try:
-        with open(f"results/{rid}/status.json", encoding="utf-8") as f:
-            c = json.load(f).get("creditsUsed")
-    except (OSError, ValueError, AttributeError):
-        c = None
-    if isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c):
-        total += c
-    else:
-        c, missing = None, missing + 1
-    rows.append((rid, c))
-print(f"total_credits={total} unavailable={missing}")
-for rid, c in rows:
-    print(f"{rid}\t{'取得不可' if c is None else c}")
-PY
+kiro-microvm show <requestId> --json
 ```
 
-タスク名は出力に含まれないので、requestId とタスク名の対応は各ステップの報告から補って内訳に載せる。
+- Sum the numeric `creditsUsed` values over the requestIds of this pipeline only.
+- If `creditsUsed` is null or missing, or `kiro-microvm show` fails for that requestId (for example the run is missing or broken), count it as unavailable. Do not add it to the total.
+- The output does not contain the task name, so fill in the correspondence between requestId and task name from the reports of the earlier steps when writing the breakdown.
 
-## 最終メッセージ
+## Final message
 
-- PR URL
-- 合計クレジットと取得不可件数
-- 残存 `kiro/*`
+- The PR URL
+- The total credits and the number of runs where the value is unavailable
+- The remaining `kiro/*` branches

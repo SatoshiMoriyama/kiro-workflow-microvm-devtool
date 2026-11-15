@@ -1,208 +1,287 @@
 # kiro-workflow-microvm-devtool
 
-Lambda MicroVMs 上で Kiro を動かすための開発ツール。pnpm モノレポ。
+Developer tooling to run [Kiro CLI](https://kiro.dev) headless inside AWS Lambda MicroVMs. It is a pnpm monorepo.
 
-MicroVM の中で Kiro CLI を headless 実行し、指示タスク（例: 札幌の天気を調べて HTML を作る）の成果物を S3 に格納する。
+A MicroVM runs `kiro-cli` on a task you give it and stores the outputs in S3. When you pass a GitHub repository, Kiro clones it, creates a branch, does the work, commits, pushes, and writes a work report (`report.json` / `report.md`). The `kiro-microvm` CLI starts runs and inspects their results.
 
-GitHub リポジトリを clone してブランチを切り、Kiro が作業して commit・push し、作業報告（`report.json` / `report.md`）まで出すフローにも対応する（`repoUrl` を動的に指示する）。
+> **Note:** The specification and availability of Lambda MicroVMs may change. Check the latest AWS documentation.
 
-## 構成
+## Security and cost warnings (read first)
+
+You run everything below in your own AWS account and with your own GitHub permissions. You are responsible for what it does.
+
+- **Kiro runs with `--trust-all-tools`.** There is nobody in the guest to approve tool calls, so Kiro can run any command with the guest's credentials. Approval prompts are not a safety barrier here. The barriers are the least-privilege execution role (see [Design notes](#design-notes)) and the network settings.
+- **Use a fine-grained GitHub PAT limited to a single repository.** Do not use a classic PAT or an all-repositories token. Based on the current code, the guest only clones and pushes over HTTPS, so the minimum permissions are:
+  - Contents: read and write (clone, create the branch, push)
+  - Metadata: read (granted automatically)
+  - Pull requests: read and write is only needed if you let Kiro or your own tooling open or update pull requests with this same token. The current guest flow does not call the pull request API.
+- **Outbound traffic is not restricted.** The image uses the `INTERNET_EGRESS` network connector, so the guest can reach any destination. A prompt-injected or misbehaving Kiro could send data anywhere it can read, including the PAT (see [Limits of approach A](#limits-of-approach-a-pat-extractability)).
+- **You are billed for MicroVM run time.** A MicroVM lives for at most 1800 seconds (`--maximum-duration-in-seconds`). Each run can cost up to that duration, plus S3, Secrets Manager, CloudWatch Logs, and Kiro credit usage. Failed or hung runs still consume time until they time out or are terminated.
+- **Limits of approach A.** The PAT is hidden from prompts, URLs, and outputs, but it is not physically blocked from the guest. See [Limits of approach A](#limits-of-approach-a-pat-extractability).
+
+### Known limitations / future work
+
+These are not implemented. They are listed as constraints and future work.
+
+- **Replace the PAT with a GitHub App installation token.** Installation tokens expire after 1 hour and can be scoped to specific repositories and permissions, which limits the damage if a token leaks.
+- **Restrict egress destinations** to GitHub, the Kiro API, and AWS only, instead of open `INTERNET_EGRESS`.
+
+## Structure
 
 ```
 .
 ├─ pnpm-workspace.yaml
-├─ package.json                 # ルート
+├─ package.json
 ├─ packages/
-│  ├─ infra/                    # CDK(TypeScript)。S3x2 + IAMx2 + CfnMicrovmImage
-│  │  ├─ bin/infra.ts
-│  │  └─ lib/microvm-stack.ts
-│  ├─ image/                    # MicroVM イメージの中身(code artifact)
-│  │  ├─ Dockerfile             # al2023-minimal + awscli + Node 22 + pnpm + kiro-cli(musl) + Python フックサーバ
-│  │  ├─ hook_server.py         # /ready に 200、/run で Kiro CLI 実行 -> 成果物+status.json を S3 に put
-│  │  ├─ steering/              # MicroVM 内 kiro-cli 用グローバル steering(手元 Kiro IDE には無関係)
-│  │  └─ test_hook_server.py    # hook_server の純関数ユニットテスト
-│  └─ runs-cli/                 # results/ 配下の run 結果を list / show / stats する Python CLI
+│  ├─ infra/        # CDK (TypeScript): S3 x2 + IAM x2 + CfnMicrovmImage
+│  ├─ image/        # MicroVM image contents (code artifact)
+│  │  ├─ Dockerfile       # al2023-minimal + awscli + Node 22 + pnpm + kiro-cli (musl) + Python hook server
+│  │  ├─ hook_server.py   # /ready returns 200; /run runs Kiro CLI and puts outputs + status.json to S3
+│  │  ├─ steering/        # global steering for kiro-cli inside the MicroVM only
+│  │  └─ test_hook_server.py
+│  └─ runs-cli/     # the `kiro-microvm` Python CLI (run / list / show / stats)
 ├─ scripts/
-│  ├─ deploy.sh                 # Base -> zip 投入 -> Image を 1 コマンドで(pnpm deploy)
-│  ├─ package-image.sh          # packages/image を zip 化し artifact バケットへ
-│  └─ run.sh                    # run-microvm -> 結果をポーリング回収 -> terminate
+│  ├─ deploy.sh           # Base -> zip upload -> Image in one command (pnpm deploy)
+│  ├─ install.sh          # installs the skills and agents into ~/.kiro
+│  └─ package-image.sh    # zips packages/image and uploads it to the artifact bucket
 ├─ .kiro/
-│  ├─ skills/                   # run-microvm(1 依頼を VM で実行)/ microvm-pipeline(分割パイプライン)
-│  └─ agents/                   # microvm-pipeline 各ステップ専用エージェント(split / run / merge / pr)
+│  ├─ skills/       # run-microvm (one request on a VM) / microvm-pipeline (split pipeline)
+│  └─ agents/       # per-step agents for the pipeline (split / run / merge / pr)
 ├─ docs/
-│  └─ microvm-pipeline-agents.md # 専用エージェント化の調査メモ
+│  └─ microvm-pipeline-agents.md   # notes on the dedicated-agent design
 └─ README.md
 ```
 
-※ 調査・設計メモ(`verification.md` / `memo.md`)は `blog/` に置き、リポジトリには含めない(gitignore)。
+## Prerequisites
 
-## 前提
+- AWS CLI 2.38+ (`lambda-microvms` subcommand). Confirmed with 2.39.0.
+- CDK CLI 2.1146 series / `aws-cdk-lib` 2.275.0 (includes `CfnMicrovmImage`)
+- Node 22, pnpm 12, and a running Docker (on your machine)
+- Python 3.10+ and [pipx](https://pipx.pypa.io/) for the CLI
+- Region `ap-northeast-1` (MicroVMs availability confirmed there)
+- An AWS profile, passed as `AWS_PROFILE=<your-profile>`
 
-- AWS CLI 2.38+（`lambda-microvms` サブコマンド）。確認済み: 2.39.0
-- CDK 2.1146 系 CLI / `aws-cdk-lib` 2.275.0（`CfnMicrovmImage` を含む）
-- Node 22 / pnpm 12 / Docker 稼働(手元)。MicroVM イメージにも Node 22(dnf `nodejs22`)と pnpm(`npm -g`、版は `packageManager` に合わせた 12.10.1)を入れる。
-- リージョン `ap-northeast-1`（MicroVMs 利用可を確認済み）
-- `AWS_PROFILE=work`
+## Setup
 
-## 設計上の要点
+The stack is split in two to avoid a chicken-and-egg problem (`CfnMicrovmImage` needs the zip, but the image build runs during deploy):
 
-- **CDK で作れるのは MicroVM イメージまで**。実行インスタンス(`Microvm`)は CFN リソースに無く、`run-microvm` API で起動する。よって起動は `scripts/run.sh`。
-- **実行モデル(非同期)**: Dockerfile の CMD でフックサーバを常駐 → `/ready` に 200 でスナップショット → `run-microvm` で復帰 → `/run` フックは Kiro CLI(`kiro-cli chat --trust-all-tools --no-interactive --output-format stream-json "<prompt>"`)実行+S3 put 一式をバックグラウンドスレッドで起動し即 200(`{"status":"accepted"}`)を返す。`/run` の `RunTimeoutInSeconds` は上限 60 秒のため Kiro をここで同期実行できない。Kiro は MicroVM が生きている限り裏で走り、完了時に生成ファイル・`kiro-stdout.txt`・`kiro-events.jsonl`・`status.json` を S3 prefix 配下へ put する。`kiro-stdout.txt` には最終応答テキスト(`runFinished.data.finalText`、取れなければ stdout 全文)を、生のイベント列(JSON Lines)は `kiro-events.jsonl` に置く。`status.json` の `creditsUsed`(number | null)は最後の `session_usage` イベントの credit 合計(丸めなし)で、タイムアウト・イベント欠落・解析失敗では `null`。`ok` 判定には影響しない。`kiro-events.jsonl` も `kiro-stdout.txt` 同様 `mask_secrets` を通してから put する。ホスト(`run.sh`)は `status.json` の出現をポーリングして完了を検知する(成否は `status.json` の `ok`/`exitCode`/`timedOut`/`failedUploads` で判定)。`RESULT_BUCKET` 未設定などバックグラウンド起動前に判明する前提エラーのみ `/run` を 500 にする。
-- **Kiro CLI(musl 版)**: Dockerfile は `kirocli-aarch64-linux-musl.zip` を導入する。AL2023 の glibc は 2.34 で gnu ビルドの要求 2.39 に満たないため(install.sh の glibc 検査で弾かれる)、静的リンクの musl ビルドを使う。認証は焼かない(`Q_SKIP_SETUP=1`)。
-- **KIRO_API_KEY の渡し方**: 実キーは IaC/イメージに焼かない。`image-stack.ts` が env `KIRO_API_KEY_SECRET_ARN`(Secret `kiro-microvm/kiro-api-key` の ARN のみ)を注入し、`/run` 実行時に executionRole の短命 credential でゲストが `aws secretsmanager get-secret-value` して取得する。値は CloudWatch Logs・S3 成果物・`status.json`・ホスト stdout のいずれにも出さない(二段マスク: 実キー値の完全一致置換 + `ksk_\S+` パターン置換)。
-- **GitHub フロー（clone→ブランチ→作業→commit→push→作業報告）**: `repoUrl` を指定した run では、hook_server が Kiro へのプロンプトに前後処理を組み込み、clone・`git config`（author 固定）・ブランチ `kiro/<requestId>` 作成・作業・commit・push・作業報告生成までを **Kiro 自身**に実行させる（hook_server はコードで git を代行しない。認証 helper の仕込みと手順提示だけ用意する）。commit author はデプロイ時に設定でき、未指定時は `kiro-bot <kiro-bot@users.noreply.github.com>`（後述「コミット author の設定」）。`baseBranch` 省略時は `main`。`repoUrl` 未指定なら従来どおり clone なしで prompt を実行する（後方互換）。
-- **GitHub 認証（方式A: PAT を Kiro に見せない）**: GitHub PAT は Secret `kiro-microvm/github-token` に入れる（実トークンは IaC/イメージに焼かない。`KIRO_API_KEY` と同思想）。`base-stack.ts` が executionRole にこの Secret の read 権限を付与し、`image-stack.ts` が env `GITHUB_TOKEN_SECRET_ARN`（ARN のみ）を注入する。hook_server は Kiro の HOME 配下に `GIT_ASKPASS` スクリプトを仕込み、`GIT_ASKPASS` / `GIT_TERMINAL_PROMPT=0` を Kiro の子プロセス env に渡す。git が資格情報を要求したときだけこのスクリプトが実行時に `aws secretsmanager get-secret-value` で PAT を取得して git に渡す。PAT 実値はプロンプトにも URL にも stdout にもスクリプト本文にも出さない。Kiro は PAT を知らずに HTTPS push できる。helper の一時ファイルは実行後に必ず削除する。PAT も `KIRO_API_KEY` と同じマスク対象に追加する（実値の完全一致置換に加え、`(gh[pousr]|github_pat)_\S+`（fine-grained PAT の `github_pat_` 形式を含む）と旧 40 桁 hex 形式のパターン置換。ただし 40 桁 hex は git のコミット SHA / blob hash と衝突するため、成果物を put させず skip する fail-closed 判定には使わず、ログ・`status.json`・stdout のマスクにのみ使う）。成果物・ファイル名・`report.*` の漏洩検査（skip 判定）は `KIRO_API_KEY` と PAT の**両実値を完全一致で検査**する（既知プレフィックスに当たらない PAT 実値も skip 対象になる）。`repoUrl` 指定時の GitHub フローは次のいずれでも Kiro を実行せず fail-closed で終える（`status.json` の `ok=false` と `failedUploads` に理由を記録。`repoUrl` 無しの従来モードは影響を受けない）: `repoUrl` が不正形式（`failedUploads` に `repoUrl-rejected`）、`GITHUB_TOKEN_SECRET_ARN` 未設定（`github-token-arn-missing`）、PAT 取得失敗（`github-token-fetch`）、credential helper の設置失敗（`git-credential-setup`）。`repoUrl` は `https://github.com/` 直下の形式のみ許可し、`user:pass@` などの userinfo を含む URL・別ホスト・非 HTTPS は拒否する。`baseBranch` とブランチ名に埋め込む `requestId` は安全な文字（英数と `-_./`）に正規化する。commit author/committer は `GIT_AUTHOR_*` / `GIT_COMMITTER_*` 環境変数でも、デプロイ時に設定した author（未指定時 `kiro-bot`）に固定する（プロンプトの `git config` 指示に加えた多重化）。`GIT_ASKPASS` helper の username 応答は `kiro-bot` 固定のまま変更しない（GitHub の token 認証では username は使われず、author 表示と無関係なため）。`report.json` / `report.md` は必須成果物として扱い、未生成・秘密検知での skip・put 失敗のいずれでも `failedUploads` に記録して `ok=false` にする（S3 に無いまま成功扱いにしない）。
-- **方式A の限界（PAT の原理的な取得可能性）**: 方式A は「PAT をプロンプト・URL・出力に出さない」ことを保証するが、PAT を物理的に遮断するものではない。`--trust-all-tools` のゲストは `GIT_ASKPASS` helper や `aws secretsmanager get-secret-value` を自分で実行すれば PAT を原理的に取得できる。そのため本方式の守りは PAT の秘匿そのものではなく、executionRole の最小権限（当該 Secret の read と、result バケットの入力取得 `s3:GetObject` を `<bucket>/*/inputs/*` のみ・成果物書き込み `s3:PutObject` を `<bucket>/*/runs/*` のみに絞った明示ポリシー）と egress 制御（INTERNET_EGRESS）に依存する。
-- **git 設定のスコープ（実機疎通時に確認）**: 方式A では Kiro の子プロセスに `HOME` を専用ディレクトリへ差し替えて `GIT_ASKPASS` helper を仕込む。`HOME` 差し替えは kiro-cli / aws CLI など git 以外のツールの設定探索にも及びうるため、実機 `run-microvm` での初回疎通時に、Kiro 本体や aws CLI の挙動に影響が出ていないかを確認する。影響が出る場合は `HOME` ごと差し替える代わりに `GIT_CONFIG_GLOBAL` 等で git に限定する方式へ切り替える。
-- **作業報告の出力**: GitHub フローでは Kiro が `report.json`（機械可読: `summary`・`changes`・`limitations`・`branch`・`pushedCommit`）と `report.md`（PR 本文に貼れる形: 何をしたか／変更点／制限事項）を生成する。既存の成果物 put 経路に加え、hook_server が同 prefix に明示的にも put を試みる（生成失敗・put 失敗は `status.json` の `failedUploads` に残る）。
-- **グローバル steering の焼き込み（MicroVM 内 kiro-cli のみ）**: 全 run 共通の注意事項を `packages/image/steering/*.md` に置き、Dockerfile で `/root/.kiro/steering/` へ `COPY` してイメージに焼き込む。Dockerfile で `ENV KIRO_HOME=/root/.kiro` を固定するため、GitHub フローで Kiro の `HOME` を per-run に差し替えても steering の読み込み先（`KIRO_HOME/steering`）は一定で、天気タスク・GitHub フロー双方に効く（グローバル steering の読み込みパスが CLI で有効なことは公式の capability matrix で確認）。フォールバックとして GitHub フローでは、hook_server のプロンプトに「clone 後、リポジトリ直下に `.kiro/steering/<name>.md` が無ければ `/root/.kiro/steering/<name>.md` をコピーして配置し、その内容を遵守する」手順を差し込む（主経路＝グローバル／フォールバック＝ワークスペースの二層）。このフォールバックで置く steering は対象リポジトリの履歴を汚さないよう `git add` から除外し commit/push に含めない。本文は `packages/image/steering/` に `.md` を足して更新し、**更新には再デプロイが必要**（`package-image.sh` が内容ハッシュを更新 → CFN 再ビルド）。S3/payload からの動的供給はしない。**この steering は MicroVM 内の headless kiro-cli にだけ効き、開発者の手元の Kiro IDE やリポジトリ直下の `.kiro/steering/` には一切関与しない。**
-- **`--trust-all-tools` の安全柵**: 人のいないゲストで承認待ちを出さないため全許可にする。承認は安全柵にならないので、代わりに executionRole の最小権限(result バケットの `<bucket>/*/inputs/*` への `s3:GetObject` と `<bucket>/*/runs/*` への `s3:PutObject`、および当該 Secret の read のみ)と egress 制御(INTERNET_EGRESS)が安全柵を担う。
-- **時間制約の階層(非同期)**: 2 つの時間制約は別物。
-  - `/run` の `RunTimeoutInSeconds`=60(`image-stack.ts`): `/run` が 200 を返すまでの上限(サービスモデル max=60)。即 200 を返すので 60 で十分。
-  - ゲスト `kiro-cli` timeout = `KIRO_TIMEOUT_SECONDS`(`hook_server.py` 既定 1200、環境変数で上書き可)。
-  - MicroVM 寿命 `--maximum-duration-in-seconds`=1800(`run.sh`): バックグラウンドの Kiro 実行時間を担保する。
-  - ホストポーリング上限=1860s(372×5s, `run.sh`): VM 寿命より少し長く待つ。
-  - 単調関係 `KIRO_TIMEOUT_SECONDS(1200) < --maximum-duration(1800) < ホストポーリング上限(1860)` を保つ。これで「ゲスト timeout でも status.json を書ける」「VM 寿命切れ前に Kiro 完了」「ポーリングが VM 寿命より先に諦めない」を同時に満たす。
-- **メモリ**: `minimumMemoryInMiB=2048`。Rust 製 kiro-cli がコンテキスト・ツール実行・子プロセス(curl)を抱えるため、baseline を 2048 にして peak 上限(自動で最大 4x)を確保する。
-- **MicroVM 内の Node / pnpm(issue #16)**: イメージに Node 22 系(AL2023 の dnf `nodejs22` + `nodejs22-npm`)と pnpm(`npm install -g pnpm@12.10.1`、`ARG PNPM_VERSION`)を入れる。これにより GitHub フローで clone した本リポジトリのような pnpm モノレポに対し、MicroVM 内の Kiro が `pnpm install` と `pnpm --filter infra exec tsc --noEmit`(可能なら `pnpm --filter infra exec cdk synth`)を実行して自己検証できる。選定理由(dnf vs 公式 tar、npm vs corepack)は Dockerfile のコメントに記載。既存の kiro-cli・hook_server・steering の層は変更していない。反映には再デプロイ(`pnpm deploy`)が必要で、**ビルド成否は未確認**(AWS 側ビルドのため MicroVM 内では実行できず、再デプロイ後に手元で確認する)。
-- **MicroVM 内 `cdk synth` の見立て(コード読みによる調査。実行は未検証)**:
-  - `artifact-hash.txt` 不在: `packages/infra/artifact-hash.txt` は gitignore 対象で clone 直後に無いが、`image-stack.ts` は `fs.existsSync` で確認し、無ければプレースホルダキー `PLACEHOLDER-run-package-image-sh-first` を使うため **throw せず synth は通る**。ダミー hash を用意する必要は無い。ただしこの出力はデプロイ用ではない(存在しない zip を指す)。
-  - AWS 認証: `bin/infra.ts` は `env.region` を `ap-northeast-1` に固定し、`account` は `CDK_DEFAULT_ACCOUNT` 由来。`Vpc.fromLookup` 等の context lookup は無く、synth 自体に AWS API 呼び出しは不要。認証が無い場合、CDK CLI はアカウントを解決できず警告を出すが、account 未解決のスタックは environment-agnostic として synth される想定。ゲストには executionRole の短命 credential があるので、解決を試みても失敗はしにくい。
-  - 実行コスト: `cdk.json` の `app` は `npx ts-node` で、synth ごとに ts-node の型検査コンパイルが走る。`aws-cdk-lib` が大きく数十秒〜1 分程度かかりうる。tsc --noEmit 同様、依存は `pnpm install` 済みが前提。
-  - 結論: 通る見込みが高いが、`pnpm --filter infra exec cdk synth` の通過は再デプロイ後に実機で確認が要る。通らない場合の第一候補は ts-node の型検査を `TS_NODE_TRANSPILE_ONLY=1` で省く(メモリ・時間の削減)こと。
-- **メモリの見立て(未実測)**: `minimumMemoryInMiB=2048`(peak は自動で最大 4x)。kiro-cli(Rust)は常駐で数百 MiB 程度、`pnpm install` は 数百 MiB、`tsc --noEmit` は `aws-cdk-lib` の型を読むため 1 GiB 前後に達しうる。`cdk synth`(ts-node)も同程度。単独なら 2048 に収まるが、kiro-cli と同時に走らせると baseline を超えて peak 側に依存する可能性がある。OOM が出た場合は `minimumMemoryInMiB` を 4096 へ上げる(`image-stack.ts` の変更が必要。本タスクでは変更しない)か、`NODE_OPTIONS=--max-old-space-size=1536` で Node のヒープを抑える。実機での実測が必要。
-- **イメージサイズ・ビルド時間の見込み(概算・未実測)**: `nodejs22` + `nodejs22-npm` で展開後およそ 100〜150 MiB、pnpm で 数十 MiB が増える見込み。ビルド時間は dnf の取得とインストール、`npm install -g pnpm` で 1 分前後の増加を見込む。`/ready` スナップショットのサイズも同程度増えるので、起動時間への影響は再デプロイ後に確認する。
-- **完了条件**: `/run` が即 200 を返した後、`run.sh` は `status.json` の出現をポーリングで待つ(バックグラウンドの Kiro 完了後に成否に関わらず必ず出る)。`status.json` の `ok`(= `exitCode==0 && !timedOut && failedUploads なし`)と `exitCode` を表示する。
-- **認証/権限**: ゲストには executionRole の短命 credential が自動付与され、`aws s3 cp` が直接叩ける。長期キー不要。
-- **code artifact の zip** は CDK 外(`package-image.sh`)で内容ハッシュ付きキー `code/app-<hash>.zip` に置き、ハッシュを `packages/infra/artifact-hash.txt` に書き出す。`ImageStack` はそれを読んで URI を決める。zip が変わればキー(= URI)が変わるので CFN が差分を検知して再ビルドする。
-- **イメージ更新は常に CFN 経由**。CLI の `update-microvm-image` を直接叩くと、指定しなかったプロパティ(環境変数・hooks)が落ちてドリフトするため使わない。
-- **依頼ごとのプレフィックス**: `run.sh` が依頼ID(`req-<日時>-<pid>`)を生成し `--run-hook-payload` の JSON で prefix を渡す。`/run` ボディは `{"microvmId","runHookPayload"}` 構造で届き、hook_server が `runHookPayload`(文字列)を再パースして `<requestId>/runs/` 配下に成果物を格納する。prefix 未指定時は `<microvmId>/runs/` にフォールバックする。
+- `KiroMicrovmBase`: S3 x2 + IAM x2 + LogGroup (no zip needed)
+- `KiroMicrovmImage`: `CfnMicrovmImage` (zip required)
 
-## 手順
+### 1. Deploy (once, at setup)
 
-鶏卵問題(`CfnMicrovmImage` は zip を要求するが deploy 中にビルドまで走るため zip を先に置けない)を避けるため、スタックを2つに分ける。
-
-- `KiroMicrovmBase`: S3 x2 + IAM x2 + LogGroup(zip 不要)
-- `KiroMicrovmImage`: `CfnMicrovmImage`(zip 必須)
+Deploy is not part of the CLI. Run it from this repository.
 
 ```bash
-# 1. 依存インストール
+# Install dependencies
 pnpm install
 
-# 2. (初回のみ) CDK bootstrap
-AWS_PROFILE=work pnpm --filter infra exec cdk bootstrap aws://495236580548/ap-northeast-1
+# (First time only) CDK bootstrap
+AWS_PROFILE=<your-profile> pnpm --filter infra exec cdk bootstrap aws://<ACCOUNT_ID>/ap-northeast-1
 
-# 3. デプロイ(Base -> zip 投入 -> Image を 1 コマンドで。scripts/deploy.sh)
-#    image の中身を変えても再実行すれば CFN が差分を検知して再ビルドする。
-AWS_PROFILE=work pnpm deploy
-
-# 4. MicroVM を起動して Kiro を実行し、成果物を回収する
-#    prompt は PROMPT 環境変数か引数(-- で渡す)で指定。省略時はデフォルト
-#    (札幌の天気を調べて weather.html を作って)。
-AWS_PROFILE=work pnpm run-microvm
-AWS_PROFILE=work PROMPT="東京の天気を調べて weather.html を作って" pnpm run-microvm
-AWS_PROFILE=work pnpm run-microvm -- "東京の天気を調べて weather.html を作って"
-
-# GitHub フロー: repoUrl を指定すると clone→ブランチ作成→作業→commit→push→作業報告まで Kiro が実行する。
-#   prompt は PROMPT か第1引数、repoUrl は REPO_URL か第2引数、baseBranch は BASE_BRANCH(既定 main)で指示する。
-AWS_PROFILE=work REPO_URL="https://github.com/owner/repo.git" \
-  PROMPT="READMEに概要を追記して" pnpm run-microvm
-AWS_PROFILE=work pnpm run-microvm -- "READMEに概要を追記して" "https://github.com/owner/repo.git"
+# Deploy Base -> zip upload -> Image (scripts/deploy.sh).
+# Re-running after changing the image contents makes CloudFormation detect the diff and rebuild.
+AWS_PROFILE=<your-profile> pnpm deploy
 ```
 
-### 入力（`--run-hook-payload` の JSON）
+`pnpm deploy` runs BaseStack, then `package-image.sh`, then ImageStack. You can also run `scripts/deploy.sh` and `scripts/package-image.sh` directly.
 
-run.sh が構造化して渡す。既存キーに加えて GitHub フロー用のキーを追加した。
+### 2. Put the secrets
 
-PROMPT（作業指示）は **S3 経由**で渡すのが既定になった。長い日本語プロンプトでも手動圧縮・英訳は不要（GitHub issue #3: `runHookPayload` は最大 4096 バイトで、日本語プロンプトは JSON 内で約 3 倍に膨らむため、payload に直接積むと溢れる）。`run.sh` は PROMPT を既存の result バケットの入力キー `<requestId>/inputs/prompt.md`（UTF-8、`kind=input` タグ付き）へ put し、payload には本文ではなく `promptKey` を載せる。hook_server は `promptKey` の S3 オブジェクトを取得して PROMPT として使う。
-
-- `promptKey`: 入力プロンプトの S3 キー。`<requestId>/inputs/prompt.md`（UTF-8、既存の result バケット内）。
-- `prompt`（後方互換）: payload に直接積む作業指示。短い場合のみ。`promptKey` が無く `prompt` があれば従来どおりそのまま使う（後方互換で引き続き受理）。省略時は既定（札幌の天気…）。
-- `prefix`: 成果物の出力先 prefix。`<requestId>/runs/`。
-- `promptKey`（=`<requestId>/inputs/prompt.md`）と `prefix`（=`<requestId>/runs/`）で入力と出力を分ける。
-- `requestId`: 依頼ID。`<requestId>/inputs/` と `<requestId>/runs/` のキー生成に使う。
-- `repoUrl`（動的指示）: clone 対象の GitHub HTTPS URL。指定時だけ GitHub フローになる。省略で従来どおり clone なし。
-- `baseBranch`: ブランチ作成の起点。省略時 `main`。
-
-`run.sh` は payload を組み立てたあと **JSON のバイトサイズを 4096 バイトと事前検証**し、超える場合は分かりやすいエラーで停止する（PROMPT を S3 へ逃がしたうえでもなお payload が 4096 バイトを超えるなら、`repoUrl` 等の他フィールドが過大。本文を payload に戻さない）。
-
-個別に叩きたい場合は従来どおり `scripts/deploy.sh`・`scripts/package-image.sh`・`scripts/run.sh` を直接実行してもよい。`pnpm deploy` は内部でこの順序(BaseStack → `package-image.sh` → ImageStack)を実行する。
-
-事前準備: Secret `kiro-microvm/kiro-api-key` に実キーを投入しておく(IaC には焼かない)。
+Put the real values into Secrets Manager. They are never baked into IaC or the image.
 
 ```bash
-AWS_PROFILE=work aws secretsmanager put-secret-value \
+# Kiro API key
+AWS_PROFILE=<your-profile> aws secretsmanager put-secret-value \
   --secret-id kiro-microvm/kiro-api-key --secret-string 'ksk_...' --region ap-northeast-1
+
+# GitHub PAT (only for the GitHub flow). Use a fine-grained PAT limited to one repository.
+AWS_PROFILE=<your-profile> aws secretsmanager put-secret-value \
+  --secret-id kiro-microvm/github-token --secret-string 'github_pat_...' --region ap-northeast-1
 ```
 
-GitHub フローを使う場合は、Secret `kiro-microvm/github-token` に GitHub PAT を投入しておく（実トークンは IaC/git に焼かない。方式A）。PAT には対象リポジトリへの push 権限が要る。
+### 3. Install the CLI
 
 ```bash
-AWS_PROFILE=work aws secretsmanager put-secret-value \
-  --secret-id kiro-microvm/github-token --secret-string 'ghp_...' --region ap-northeast-1
+pipx install ./packages/runs-cli
 ```
 
-### コミット author の設定（デプロイ時）
+This puts `kiro-microvm` on your `PATH`. You can run it from any directory.
 
-MicroVM 内 Kiro が作る commit の author/committer は、デプロイ時に設定できる。
+### 4. Configure the CLI
 
-- **既定（未指定時）**: `kiro-bot <kiro-bot@users.noreply.github.com>`。従来と同じ。
-- **指定方法**: 次のどちらか。
+Settings come from `~/.config/kiro-microvm/config` (`KEY=VALUE` lines) and from environment variables. Precedence: CLI argument > environment variable > config file.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `AWS_PROFILE` | none | Required |
+| `AWS_REGION` | `ap-northeast-1` | |
+| `STACK_NAME` | `KiroMicrovmBase` | |
+| `MICROVM_IMAGE_NAME` | `kiro-microvm` | |
+| `KIRO_MICROVM_RESULTS_DIR` | `~/.local/share/kiro-microvm/results/` | Where results are stored |
 
 ```bash
-# 環境変数で指定（deploy.sh は変更不要。cdk プロセスに継承される）
+mkdir -p ~/.config/kiro-microvm
+echo 'AWS_PROFILE=<your-profile>' > ~/.config/kiro-microvm/config
+```
+
+## Usage
+
+```bash
+kiro-microvm run [PROMPT] [--repo-url URL] [--base-branch B] [--request-id ID] [--json]
+kiro-microvm list [--json]
+kiro-microvm show REQUEST_ID [--json]
+kiro-microvm stats [--json]
+```
+
+```bash
+# Run a task and collect the outputs
+kiro-microvm run "Look up the weather in Tokyo and create weather.html"
+
+# GitHub flow: clone -> branch -> work -> commit -> push -> work report
+kiro-microvm run "Add an overview to the README" \
+  --repo-url https://github.com/owner/repo.git --base-branch main
+
+# Inspect results
+kiro-microvm list
+kiro-microvm show <request-id>
+kiro-microvm stats        # success rate, total credits used, runs without credit data
+```
+
+Results are collected under `~/.local/share/kiro-microvm/results/<requestId>/` (override with `KIRO_MICROVM_RESULTS_DIR`). The CLI waits for `status.json` to appear, prints `ok` and `exitCode` (and whether a work report exists), and terminates the MicroVM.
+
+### Run input (`--run-hook-payload` JSON)
+
+The CLI builds the payload. The prompt is passed through S3, not inline, because `runHookPayload` is limited to 4096 bytes (a non-ASCII prompt grows about 3x in JSON; GitHub issue #3). The CLI puts the prompt at `<requestId>/inputs/prompt.md` (UTF-8, tagged `kind=input`) in the result bucket and puts `promptKey` in the payload. `hook_server` fetches that object as the prompt.
+
+- `promptKey`: S3 key of the input prompt, `<requestId>/inputs/prompt.md`.
+- `prompt` (backward compatible): inline prompt, for short prompts only. Used when `promptKey` is absent. A default prompt is used if both are absent.
+- `prefix`: output prefix, `<requestId>/runs/`.
+- `requestId`: request ID, used to build the `inputs/` and `runs/` keys.
+- `repoUrl`: GitHub HTTPS URL to clone. Setting it enables the GitHub flow. Without it, the prompt runs with no clone.
+- `baseBranch`: branch to start from. Defaults to `main`.
+
+The CLI checks the payload JSON size against 4096 bytes before sending and stops with an error if it is exceeded.
+
+### Expected output
+
+`<requestId>/runs/` contains `status.json`, `kiro-stdout.txt`, `kiro-events.jsonl`, and the generated files. The GitHub flow adds `report.json` and `report.md`. Strings starting with `ksk_` and GitHub PATs must not appear in CloudWatch Logs, any S3 object, `report.*`, `status.json`, or host stdout.
+
+### Commit author (set at deploy time)
+
+The author and committer of commits made by Kiro in the MicroVM are set at deploy time.
+
+- **Default:** `kiro-bot <kiro-bot@users.noreply.github.com>`.
+- **How to set it:**
+
+```bash
+# Environment variables (inherited by the cdk process; deploy.sh needs no change)
 KIRO_GIT_AUTHOR_NAME="Taro Yamada" KIRO_GIT_AUTHOR_EMAIL="12345+taro@users.noreply.github.com" \
-  AWS_PROFILE=work pnpm deploy
+  AWS_PROFILE=<your-profile> pnpm deploy
 
-# CDK コンテキストで指定
-AWS_PROFILE=work pnpm --filter infra exec cdk deploy KiroMicrovmImage \
+# CDK context
+AWS_PROFILE=<your-profile> pnpm --filter infra exec cdk deploy KiroMicrovmImage \
   -c gitAuthorName="Taro Yamada" -c gitAuthorEmail="12345+taro@users.noreply.github.com"
 ```
 
-- **優先順位**: コンテキスト `gitAuthorName` / `gitAuthorEmail` > 環境変数 `KIRO_GIT_AUTHOR_NAME` / `KIRO_GIT_AUTHOR_EMAIL`。各値は trim し、空文字は未指定扱い（空のコンテキストなら環境変数を見る）。名前とメールは項目ごとに独立し、片方だけ指定するともう片方は既定値になる。
-- **反映の仕組み**: 指定した項目だけ ImageStack が MicroVM イメージの環境変数 `KIRO_GIT_AUTHOR_NAME` / `KIRO_GIT_AUTHOR_EMAIL` として注入する。`hook_server.py` が実行時にこれを読み、commit 用 env（`GIT_AUTHOR_*` / `GIT_COMMITTER_*`）とプロンプトの `git config user.name` / `git config user.email` 指示に使う。
-- **検証規則**: 値は trim 後に評価する。名前・メールとも、制御文字（U+0000〜U+001F と U+007F）および `"` `\` `` ` `` `$` `<` `>` を含めてはならない。メールはさらに正規表現 `^[^@\s]+@[^@\s]+$` に一致する必要がある。値はプロンプト内で `git config user.name "<値>"` としてシェル実行されるため、引用・展開を壊す文字を拒否する。`<` `>` は git の ident で使えない。
-- **不正値の扱い**: ImageStack は synth 時に Error を throw し、デプロイさせない。イメージ側でも不正値は警告ログ（変数名のみ。値は出さない）を出して既定値にフォールバックする。
-- **反映タイミング**: 再デプロイ（`pnpm deploy`）が必要。ラン単位（`run.sh` / `runHookPayload`）では切り替えられない。
-- **GitHub 上のアイコン表示**: 実行者のアイコンを表示させたい場合は、GitHub アカウントに紐づくメール（`<id>+<user>@users.noreply.github.com` 形式の noreply アドレス、またはアカウントで確認済みのメール）を指定する。
-- **手元の commit**: 手元側のマージコミット等は手元の git 設定の author になり、この設定の影響を受けない。
+- **Precedence:** context `gitAuthorName` / `gitAuthorEmail` > environment `KIRO_GIT_AUTHOR_NAME` / `KIRO_GIT_AUTHOR_EMAIL`. Values are trimmed and an empty string counts as unset. Name and email are independent: setting one leaves the other at its default.
+- **How it takes effect:** ImageStack injects each specified item as the image environment variable of the same name. `hook_server.py` reads it at run time and uses it for the commit env (`GIT_AUTHOR_*` / `GIT_COMMITTER_*`) and for the `git config user.name` / `git config user.email` instructions in the prompt.
+- **Validation:** after trimming, neither value may contain control characters (U+0000 to U+001F, U+007F) or any of `"` `\` `` ` `` `$` `<` `>`. The email must also match `^[^@\s]+@[^@\s]+$`. The values are executed in a shell as `git config user.name "<value>"`, so characters that break quoting or expansion are rejected.
+- **Invalid values:** ImageStack throws at synth time and does not deploy. On the image side, an invalid value logs a warning (variable name only, never the value) and falls back to the default.
+- **When it applies:** after redeploy (`pnpm deploy`). It cannot be changed per run.
+- **Avatar on GitHub:** use an email linked to your GitHub account (a `<id>+<user>@users.noreply.github.com` noreply address, or a verified email).
+- **Local commits:** merge commits you make locally use your local git config and are not affected.
 
-期待結果: `<requestId>/runs/` 配下に `status.json`・`kiro-stdout.txt`・`kiro-events.jsonl`・成果物(`weather.html` など)が出る（入力プロンプトは `<requestId>/inputs/prompt.md`）。GitHub フローでは加えて `report.json`・`report.md` が同 prefix に出る。`run.sh` は `status.json` の出現を待ち、`ok` と `exitCode`（および作業報告の有無）を表示して `results/<requestId>/` に回収する。`ksk_` で始まる文字列と GitHub PAT は CloudWatch Logs・S3 の全オブジェクト・`report.*`・`status.json`・ホスト stdout のいずれにも出ない。既存の非同期実行モデル・時間制約の単調関係（`KIRO_TIMEOUT_SECONDS(1200) < --maximum-duration(1800) < ポーリング上限(1860)`）・二段マスク設計は変更していない（GitHub フローは既存経路への追加であって置き換えではない）。
+To change the kiro-cli download URL or version, edit the `ARG KIRO_CLI_DL_URL` default in `packages/image/Dockerfile` directly (the image is built on the AWS side, so there is no build-arg path), then run `scripts/package-image.sh` and `cdk deploy KiroMicrovmImage`.
 
-kiro-cli の配布 URL や版を変えるときは、`run-microvm` が AWS 側ビルドのため build-arg 経路が無い。`packages/image/Dockerfile` の `ARG KIRO_CLI_DL_URL` 既定値を直接編集 → 手順 4(`package-image.sh`)→ 手順 5(`cdk deploy KiroMicrovmImage`)で再ビルドする。
+## Split pipeline (skills and agents)
 
-## 結果の確認（runs-cli）
+The pipeline splits one request into a leading (shared foundation) task and parallel tasks, implements each on a MicroVM with kiro-cli, merges into an integration branch, runs multi-model review, handles findings, and opens a PR, all in one `run_workflow`.
 
-`run.sh` が `results/<requestId>/` に回収した結果を一覧・表示・集計する。
+- Skills: `.kiro/skills/microvm-pipeline/SKILL.md` (overall structure, review policy, pause relay) and `.kiro/skills/run-microvm/SKILL.md` (one request).
+- Step agents: `microvm-split` / `microvm-run` / `microvm-merge` / `microvm-pr` in `.kiro/agents/`. They are the primary source for step-specific rules.
+- Background and design rationale: [docs/microvm-pipeline-agents.md](docs/microvm-pipeline-agents.md)
+- Prompt mix-up check: uses `promptSha256` in `status.json` (SHA-256 of the unmasked prompt). The `prompt` body can be replaced with `[REDACTED]` by `mask_secrets`, so it is not used for matching.
+
+### Prerequisites for using the skills and agents
+
+1. Complete [Setup](#setup): deploy the stacks and put the secrets.
+2. Install the CLI so that `kiro-microvm` is on your `PATH` (`pipx install ./packages/runs-cli`).
+3. Configure it (`AWS_PROFILE` at minimum), as in [Configure the CLI](#4-configure-the-cli).
+4. Install the skills and agents into `~/.kiro/skills` and `~/.kiro/agents` with `scripts/install.sh`:
 
 ```bash
-pnpm runs:list    # run 一覧（--ok-only などで絞り込み）
-pnpm runs:show -- <requestId>   # 1 件の詳細（requestId は runs:list の表示から取る）
-pnpm runs:stats   # 集計（成功率、使用クレジット合計、クレジット取得不可件数）
-pnpm runs:test    # runs-cli のユニットテスト
+scripts/install.sh            # copy
+scripts/install.sh --link     # symlink (for development)
+scripts/install.sh --force    # overwrite existing files
+scripts/install.sh --dry-run  # show what would happen
+scripts/install.sh --uninstall
 ```
 
-## MicroVM 分割パイプライン
+Your current directory does not need to be this repository. Use the skills from your own project's directory.
 
-1 つの依頼を「先行（共通基盤）タスク」と「並列タスク」に分割し、各タスクを MicroVM 上の kiro-cli で実装、統合ブランチへマージ、マルチモデルレビュー、指摘対応、PR 作成までを 1 つの `run_workflow` で実行する。
+## Design notes
 
-- スキル: `.kiro/skills/microvm-pipeline/SKILL.md`（全体構成・レビュー方針・pause 仲介）、`.kiro/skills/run-microvm/SKILL.md`（1 依頼の実行）
-- ステップ専用エージェント: `.kiro/agents/` の `microvm-split` / `microvm-run` / `microvm-merge` / `microvm-pr`。ステップ固有ルールの一次ソース
-- 経緯と設計根拠: `docs/microvm-pipeline-agents.md`
-- PROMPT 取り違え照合: `status.json` の `promptSha256`（マスク前 prompt の SHA-256）で行う。`prompt` 本文は `mask_secrets` で `[REDACTED]` に置換されうるため照合に使わない
+- **CDK only builds up to the MicroVM image.** The running instance (`Microvm`) is not a CloudFormation resource and is started with the `run-microvm` API, which `kiro-microvm run` calls.
+- **Async execution model.** The Dockerfile `CMD` keeps the hook server running. `/ready` returns 200 and the snapshot is taken. `run-microvm` restores it. The `/run` hook starts the Kiro CLI run (`kiro-cli chat --trust-all-tools --no-interactive --output-format stream-json "<prompt>"`) and the S3 puts in a background thread and returns 200 (`{"status":"accepted"}`) at once, because `/run` `RunTimeoutInSeconds` is capped at 60 seconds. When Kiro finishes, it puts the generated files, `kiro-stdout.txt`, `kiro-events.jsonl`, and `status.json` under the S3 prefix.
+  - `kiro-stdout.txt` holds the final response text (`runFinished.data.finalText`, or the whole stdout if unavailable). The raw event stream (JSON Lines) is in `kiro-events.jsonl`, passed through `mask_secrets` like `kiro-stdout.txt`.
+  - `status.json` `creditsUsed` (number | null) is the total credits of the last `session_usage` event, unrounded, and `null` on timeout, missing events, or parse failure. It does not affect `ok`.
+  - Success is judged by `status.json` fields `ok` / `exitCode` / `timedOut` / `failedUploads`. Only preconditions known before the background start (for example `RESULT_BUCKET` unset) make `/run` return 500.
+- **Kiro CLI (musl build).** The Dockerfile installs `kirocli-aarch64-linux-musl.zip`. AL2023 has glibc 2.34, below the 2.39 the gnu build requires, so the statically linked musl build is used. Authentication is not baked in (`Q_SKIP_SETUP=1`).
+- **How `KIRO_API_KEY` is passed.** The real key is not in IaC or the image. `image-stack.ts` injects `KIRO_API_KEY_SECRET_ARN` (the ARN of `kiro-microvm/kiro-api-key` only). At `/run` the guest fetches it with `aws secretsmanager get-secret-value` using the execution role's short-lived credentials. The value is kept out of CloudWatch Logs, S3 outputs, `status.json`, and host stdout by two-stage masking: exact-match replacement of the real value, plus a `ksk_\S+` pattern replacement.
+- **GitHub flow (clone, branch, work, commit, push, report).** For a run with `repoUrl`, `hook_server` wraps the prompt with pre- and post-steps and has **Kiro itself** clone, run `git config` (fixed author), create branch `kiro/<requestId>`, work, commit, push, and write the report. `hook_server` does not run git on its behalf; it only sets up the credential helper and gives the steps. `baseBranch` defaults to `main`.
+- **GitHub authentication (approach A: the PAT is not shown to Kiro).** The PAT lives in Secret `kiro-microvm/github-token`. `base-stack.ts` grants the execution role read on that Secret, and `image-stack.ts` injects `GITHUB_TOKEN_SECRET_ARN` (ARN only). `hook_server` places a `GIT_ASKPASS` script under Kiro's `HOME` and passes `GIT_ASKPASS` / `GIT_TERMINAL_PROMPT=0` to Kiro's child processes. Only when git asks for credentials does the script fetch the PAT with `aws secretsmanager get-secret-value`. The PAT value never appears in the prompt, URLs, stdout, or the script body. The helper's temporary files are always deleted after the run.
+  - **Masking:** the PAT is masked like `KIRO_API_KEY`: exact-match replacement, plus patterns `(gh[pousr]|github_pat)_\S+` (including the fine-grained `github_pat_` form) and the old 40-hex form. The 40-hex pattern collides with git commit SHAs and blob hashes, so it is used only for masking logs, `status.json`, and stdout, never for the fail-closed decision to skip uploading outputs.
+  - **Leak checks:** artifacts, file names, and `report.*` are checked against the exact values of both `KIRO_API_KEY` and the PAT, so a PAT value that matches no known prefix also causes a skip.
+  - **Fail-closed cases:** with `repoUrl` set, Kiro is not run and the run ends with `ok=false` and a reason in `failedUploads` for: malformed `repoUrl` (`repoUrl-rejected`), missing `GITHUB_TOKEN_SECRET_ARN` (`github-token-arn-missing`), PAT fetch failure (`github-token-fetch`), and credential helper setup failure (`git-credential-setup`). Runs without `repoUrl` are unaffected.
+  - **Input validation:** `repoUrl` must be directly under `https://github.com/`. URLs with userinfo such as `user:pass@`, other hosts, and non-HTTPS are rejected. `baseBranch` and the `requestId` in the branch name are normalized to safe characters (alphanumerics and `-_./`).
+  - **Author:** the author and committer are also fixed through `GIT_AUTHOR_*` / `GIT_COMMITTER_*`, in addition to the prompt's `git config` instructions. The helper's username answer stays `kiro-bot` (GitHub token auth ignores it).
+  - **Required reports:** `report.json` / `report.md` are required artifacts. If they are missing, skipped by secret detection, or fail to upload, that is recorded in `failedUploads` and `ok=false`.
 
-## 検証状況
+### Limits of approach A (PAT extractability)
 
-確認済み(実機):
-- `lambda-microvms` は東京で利用可、base image は `al2023-1` 版 `2`。
-- `CfnMicrovmImage` の enum: architecture=`ARM_64`、hooks の ready/run=`ENABLED`/`DISABLED`。
-- `egressNetworkConnectors` はマネージドコネクタ ARN(`arn:aws:lambda:<region>:aws:network-connector:aws-network-connector:INTERNET_EGRESS`)。
-- zip 不在ビルドは `"The artifact was not found in S3."` で失敗 → Base/Image の2スタック分割で解消。
+Approach A guarantees that the PAT is not placed in prompts, URLs, or outputs. It does not physically block access. A `--trust-all-tools` guest can run the `GIT_ASKPASS` helper or `aws secretsmanager get-secret-value` itself and obtain the PAT in principle. The defense therefore does not rest on hiding the PAT. It rests on:
 
-確認済み(2026-10-28 実機疎通):
-- イメージビルド成功(Graviton3/4 とも SUCCESSFUL)。Dockerfile の dnf(python3/awscli) と /ready フックが通る。
-- `run-microvm`(INTERNET_EGRESS) -> /run フック -> executionRole で `aws s3 cp` -> result バケットに出力 -> 手元で回収 -> terminate、まで全経路成立。
-- 出力例: `hello from microvm 2026-10-27T20:23:43.780973+00:00`
-- `run-microvm` レスポンスの識別子は `microvmId`。
+- Least privilege on the execution role: read on that one Secret, `s3:GetObject` only on `<bucket>/*/inputs/*`, and `s3:PutObject` only on `<bucket>/*/runs/*` of the result bucket (explicit policy).
+- Egress control (`INTERNET_EGRESS`), which is currently open. See [Known limitations / future work](#known-limitations--future-work).
 
-その後 echo を Kiro CLI の headless 実行に置き換え、「札幌の天気を調べて weather.html を作って」で成果物が `<requestId>/runs/` 配下に出ることを実機確認済み(KIRO_API_KEY 漏洩なし、`ok:true`)。設計メモは `blog/verification.md`(リポジトリ外)。
+Use a single-repository fine-grained PAT so that extraction exposes as little as possible.
+
+### Other notes
+
+- **Git config scope (to confirm on first real run).** Approach A replaces Kiro's child-process `HOME` with a dedicated directory for the `GIT_ASKPASS` helper. This can affect config lookup of non-git tools such as kiro-cli and the aws CLI. On the first real `run-microvm`, check that Kiro and the aws CLI behave normally. If not, switch to limiting the change to git with `GIT_CONFIG_GLOBAL` and similar, instead of replacing `HOME`.
+- **Global steering (MicroVM kiro-cli only).** Steering shared by all runs is placed in `packages/image/steering/*.md` and copied to `/root/.kiro/steering/` in the Dockerfile. `ENV KIRO_HOME=/root/.kiro` keeps the load path constant even though the GitHub flow replaces `HOME` per run. As a fallback, the GitHub flow prompt tells Kiro to copy `/root/.kiro/steering/<name>.md` into the clone's `.kiro/steering/` if absent and to exclude it from `git add`. Updating the steering requires a redeploy. This steering affects only the headless kiro-cli in the MicroVM, not your local Kiro IDE or the repository's `.kiro/steering/`.
+- **Time limits (async).**
+  - `/run` `RunTimeoutInSeconds` = 60 (`image-stack.ts`): the limit until `/run` returns 200 (service model max = 60). It returns at once, so 60 is enough.
+  - Guest kiro-cli timeout = `KIRO_TIMEOUT_SECONDS` (`hook_server.py` default 1200, overridable by env).
+  - MicroVM lifetime `--maximum-duration-in-seconds` = 1800 (set by the CLI): covers the background Kiro run.
+  - Host polling limit = 1860 s (372 x 5 s, in the CLI): slightly longer than the VM lifetime.
+  - Keep `KIRO_TIMEOUT_SECONDS (1200) < --maximum-duration (1800) < host polling limit (1860)`. This lets the guest write `status.json` even on timeout, lets Kiro finish before the VM expires, and keeps the poll from giving up before the VM lifetime ends.
+- **Memory.** `minimumMemoryInMiB=2048`. This leaves headroom for the Rust kiro-cli, tool runs, and child processes; the peak limit is automatically up to 4x. Not measured. If OOM occurs, raise `minimumMemoryInMiB` to 4096 in `image-stack.ts` or limit Node with `NODE_OPTIONS=--max-old-space-size=1536`.
+- **Node and pnpm in the MicroVM (issue #16).** The image includes Node 22 (AL2023 dnf `nodejs22` + `nodejs22-npm`) and pnpm (`npm install -g pnpm@12.10.1`, `ARG PNPM_VERSION`), so Kiro can run `pnpm install` and `pnpm --filter infra exec tsc --noEmit` on a pnpm monorepo such as this one. The rationale (dnf vs official tar, npm vs corepack) is in the Dockerfile comments. Applying it needs a redeploy (`pnpm deploy`). **The build result is unconfirmed**, since the build runs on the AWS side.
+- **`cdk synth` inside the MicroVM (from reading the code, not run).**
+  - `packages/infra/artifact-hash.txt` is gitignored and absent after a clone. `image-stack.ts` checks with `fs.existsSync` and uses the placeholder key `PLACEHOLDER-run-package-image-sh-first`, so synth does not throw. The output is not deployable.
+  - `bin/infra.ts` fixes `env.region` to `ap-northeast-1`, and `account` comes from `CDK_DEFAULT_ACCOUNT`. There are no context lookups, so synth needs no AWS API calls.
+  - `cdk.json` runs `npx ts-node`, so each synth type-checks, which may take tens of seconds to a minute. If it fails, the first thing to try is `TS_NODE_TRANSPILE_ONLY=1`.
+  - It is likely to pass, but confirm with `pnpm --filter infra exec cdk synth` after redeploy.
+- **Image size and build time (rough, unmeasured).** `nodejs22` + `nodejs22-npm` add roughly 100 to 150 MiB and pnpm tens of MiB. Expect about 1 minute more build time. The `/ready` snapshot grows similarly, so check startup time after redeploy.
+- **Completion condition.** After `/run` returns 200, the CLI polls for `status.json`, which always appears after the background Kiro run ends, whether it succeeded or not. `ok` means `exitCode==0 && !timedOut && no failedUploads`.
+- **Authentication and permissions.** The guest gets short-lived execution-role credentials automatically, so `aws s3 cp` works directly. No long-lived keys are needed.
+- **Code artifact zip.** `package-image.sh` places the zip outside CDK under the content-hash key `code/app-<hash>.zip` and writes the hash to `packages/infra/artifact-hash.txt`. `ImageStack` reads it to determine the URI. When the zip changes, the key (and URI) changes, so CloudFormation detects the diff and rebuilds.
+- **Always update the image through CloudFormation.** Calling `update-microvm-image` directly drops properties you did not specify (environment variables, hooks) and causes drift, so do not use it.
+- **Per-request prefix.** The CLI generates a request ID (`req-<datetime>-<pid>`) and passes the prefix in the `--run-hook-payload` JSON. The `/run` body arrives as `{"microvmId","runHookPayload"}`. `hook_server` re-parses `runHookPayload` (a string) and stores outputs under `<requestId>/runs/`. If no prefix is given, it falls back to `<microvmId>/runs/`.
+
+## Verification status
+
+Confirmed on real infrastructure:
+- `lambda-microvms` is available in Tokyo; the base image is `al2023-1` version `2`.
+- `CfnMicrovmImage` enums: architecture=`ARM_64`, hooks ready/run=`ENABLED`/`DISABLED`.
+- `egressNetworkConnectors` takes the managed connector ARN (`arn:aws:lambda:<region>:aws:network-connector:aws-network-connector:INTERNET_EGRESS`).
+- A build without the zip fails with `"The artifact was not found in S3."`, which the two-stack split resolves.
+
+Confirmed end to end (2026-10-28):
+- Image build succeeded (Graviton3/4 both SUCCESSFUL). The Dockerfile dnf step (python3/awscli) and the /ready hook work.
+- `run-microvm` (INTERNET_EGRESS) -> /run hook -> `aws s3 cp` with the execution role -> output in the result bucket -> collected locally -> terminate.
+- The `run-microvm` response identifier is `microvmId`.
+
+After that, the echo was replaced with a headless Kiro CLI run, and a task ("look up the weather in Sapporo and create weather.html") produced outputs under `<requestId>/runs/` (no `KIRO_API_KEY` leak, `ok:true`).
