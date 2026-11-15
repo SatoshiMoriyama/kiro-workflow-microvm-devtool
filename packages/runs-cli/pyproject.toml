@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kiro-microvm"
+version = "0.1.0"
+description = "Run Kiro CLI headless on Lambda MicroVMs and inspect the results"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+kiro-microvm = "runs_cli.__main__:main"
+
+[tool.setuptools]
+packages = ["runs_cli"]
