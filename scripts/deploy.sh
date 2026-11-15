@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Base -> zip 投入 -> Image の順で 1 コマンドデプロイする。
-# 鶏卵問題(CfnMicrovmImage は zip を要求)と、イメージ中身変更時の再ビルドを
-# この順序で吸収する。
+# One-command deploy: Base stack -> zip upload -> Image stack.
+# This order resolves the chicken-and-egg problem (CfnMicrovmImage requires the
+# zip, and the image build runs during deploy) and makes image content changes
+# trigger a rebuild.
 #
-# 使い方:
-#   AWS_PROFILE=work pnpm deploy
-#   AWS_PROFILE=work pnpm run deploy        # 同じ
+# Usage:
+#   AWS_PROFILE=<your-profile> pnpm deploy
+#   AWS_PROFILE=<your-profile> pnpm run deploy   # same
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo "[deploy] 1/3 BaseStack をデプロイ"
+echo "[deploy] 1/3 Deploying BaseStack"
 pnpm --filter infra exec cdk deploy KiroMicrovmBase --require-approval never
 
-echo "[deploy] 2/3 image を zip 化して artifact バケットへ投入"
+echo "[deploy] 2/3 Zipping the image and uploading it to the artifact bucket"
 "$ROOT/scripts/package-image.sh"
 
-echo "[deploy] 3/3 ImageStack をデプロイ(ここでイメージビルドが走る)"
+echo "[deploy] 3/3 Deploying ImageStack (the image build runs here)"
 pnpm --filter infra exec cdk deploy KiroMicrovmImage --require-approval never
 
-echo "[deploy] 完了。実行は: AWS_PROFILE=work pnpm run-microvm"
+echo "[deploy] Done. To run a task: kiro-microvm run \"<prompt>\""
