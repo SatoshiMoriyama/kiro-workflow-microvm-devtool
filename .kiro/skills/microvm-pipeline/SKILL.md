@@ -1,102 +1,103 @@
 ---
 name: microvm-pipeline
-description: 1 つの依頼を「先行(共通基盤)タスク」と「並列可能タスク」に分割し、各タスクを MicroVM 上の kiro-cli に投げて実装させる分割パイプライン。先行タスクを統合ブランチにマージしてから並列タスクをその上で走らせ、全並列タスクをマージしてからまとめてマルチモデルレビュー、指摘対応も MicroVM で行い、最後に 1 つの統合ブランチから PR を作る。作業分解・先行・並列・マージ・レビュー・指摘対応ループ・PR までを 1 つの run_workflow にまとめて実行する。ユーザーが「microVM 分割パイプラインで」「依頼を分割して並列で MicroVM に作業させて」「分割して MicroVM パイプラインで実装して」のように明示的に起動したときに使う。
+description: Split pipeline that divides one request into a "lead (shared foundation) task" and "parallelizable tasks", has kiro-cli on a MicroVM implement each task, merges the lead task into an integration branch before running the parallel tasks on top of it, merges all parallel tasks, runs a multi-model review on the whole, handles review findings on MicroVM as well, and finally opens one PR from the single integration branch. Task decomposition, lead, parallel, merge, review, the fix loop and the PR are all executed in one run_workflow. Use it when the user explicitly asks to start it, for example "use the microVM split pipeline", "split the request and let MicroVMs work on it in parallel" or "implement this with the MicroVM pipeline".
 ---
 
 # microvm-pipeline
 
-1 件の実装依頼を、MicroVM 上の kiro-cli を複数使って実装する動的パイプライン。**作業分解 → 先行タスク → 先行マージ → 並列タスク → 全並列マージ → まとめてマルチモデルレビュー → 指摘対応ループ → PR** までを **1 つの run_workflow** にまとめて実行する。
+A dynamic pipeline that implements one implementation request using several kiro-cli instances on MicroVMs. It runs **task decomposition -> lead task -> lead merge -> parallel tasks -> merge of all parallel tasks -> one multi-model review of the whole -> fix loop for findings -> PR** inside **a single run_workflow**.
 
-ステップ固有ルールの一次ソースは `.kiro/agents/` の専用エージェント定義(microvm-split / microvm-run / microvm-merge / microvm-pr)。このスキルには全体構成・レビュー方針・pause 仲介だけを残し、同じルールを二重に書かない。
+The step-specific rules have their primary source in the dedicated agent definitions under `.kiro/agents/` (microvm-split / microvm-run / microvm-merge / microvm-pr). This skill keeps only the overall structure, the review policy and the pause mediation, and does not duplicate the same rules.
 
-このスキルの役割は、依頼を受けて 1 本の workflow を組み立て(run_workflow の workflowPrompt)、起動することと、workflow が pause してユーザー判断を求めてきたときに仲介すること。構成は依頼ごとに分割数・依存関係が変わるため固定レシピにはせず、毎回 workflowPrompt で生成する。workflow の先頭に作業分解ステップを置き、その結果で後続を `replace_remaining` により動的生成する。
+The role of this skill is to receive a request, assemble one workflow (the workflowPrompt of run_workflow) and start it, and to mediate when the workflow pauses and asks for a user decision. The number of splits and the dependencies change with each request, so this is not a fixed recipe; the workflowPrompt is generated every time. A decomposition step is placed at the head of the workflow, and its result is used to generate the following steps dynamically through `replace_remaining`.
 
-## 責務の境界(最重要)
+## Responsibility boundary (most important)
 
-- **MicroVM 内の kiro-cli**: 各タスクの「実装そのもの」だけ(clone → ブランチ作成 → 作業 → commit → push)。マージ・PR・レビューはしない。
-- **workflow 内の手元側ステップ(MicroVM 外)**: 統合ブランチ作成、`pnpm run-microvm` の起動と結果回収、マージ、マージ済み作業ブランチの削除、PR 作成。git 操作とマージは MicroVM にはやらせず、専用エージェント(microvm-run / microvm-merge / microvm-pr)が担う。
-- **workflow 内のレビュー/集約ステップ**: マルチモデルレビューと集約。
-- **このスキル(オーケストレーター)**: 入力を聞き、workflow を組んで起動し、pause 時にユーザーへ判断を仲介する。
+- **kiro-cli inside the MicroVM**: only "the implementation itself" of each task (clone -> create branch -> work -> commit -> push). It does not merge, create PRs or review.
+- **Local-side steps in the workflow (outside the MicroVM)**: creating the integration branch, starting `kiro-microvm run` and collecting its results, merging, deleting merged work branches, and creating the PR. Git operations and merges are not delegated to the MicroVM; the dedicated agents (microvm-run / microvm-merge / microvm-pr) do them.
+- **Review/aggregation steps in the workflow**: the multi-model review and the aggregation.
+- **This skill (the orchestrator)**: asks for the inputs, assembles and starts the workflow, and mediates user decisions when it pauses.
 
-## 前提
+## Prerequisites
 
-- run-microvm skill(.kiro/skills/run-microvm/SKILL.md)と同じ MicroVM 実行基盤を使う。各タスク実行の手順は microvm-run エージェント(`.kiro/agents/microvm-run.md`)が run-microvm skill に従って行う。
-- GitHub フロー前提。REPO_URL が必須(https://github.com/owner/repo.git)。デプロイ済み・Secret(kiro-api-key / github-token)投入済み・AWS SSO 有効・gh 認証済みであること。未整備なら run-microvm skill のガードに従い中断・報告する。
-- **AWS プロファイルは必須入力。既定のフォールバックは無い**(公開前提)。手順 1 で毎回ユーザーに聞き、workflowPrompt に明記して各ステップへ渡す。
-- MicroVM の GitHub フローは「渡された base ブランチを clone → kiro/<requestId> ブランチを切って作業 → push」までで、マージはしない。base は run-microvm に BASE_BRANCH で渡す。
-- MicroVM が作る実装コミットの author はデプロイ時設定(未指定時 `kiro-bot <kiro-bot@users.noreply.github.com>`、詳細は README「コミット author の設定」)で、パイプラインやラン単位では変えない。microvm-merge が作るマージコミットは手元の git 設定の author になる。両者を同じ名義にしたい場合は、デプロイ時に手元と同じ author(GitHub アカウントに紐づくメール)を設定する。
-- レビューは workflow-review.md(ユーザーのグローバル steering)に従う: Claude 中量級 + GPT 中量級の 2 系統並列 + 中量級の集約。高級モデル・高 effort は使わない。モデル ID は実行環境の生きた一覧から解決する(ハードコードしない)。
+- It uses the same MicroVM execution base as the run-microvm skill (`.kiro/skills/run-microvm/SKILL.md`). The microvm-run agent (`.kiro/agents/microvm-run.md`) runs each task following the run-microvm skill.
+- The `kiro-microvm` command must be on PATH. It does not depend on the current directory, so the workflow does not need to run inside the devtool repository. If it is missing, ask the user to install it (`pipx install ./packages/runs-cli`, or run `scripts/install.sh`, which prints the instructions) and stop.
+- GitHub flow only. REPO_URL is required (https://github.com/owner/repo.git). Deployment must be done, the secrets (kiro-api-key / github-token) populated, AWS SSO valid and gh authenticated. If anything is missing, stop and report following the guards of the run-microvm skill.
+- **The AWS profile is a required input. There is no default fallback** (public-release premise). Ask the user every time in step 1, state it in the workflowPrompt, and pass it to each step.
+- The GitHub flow of the MicroVM goes only as far as "clone the given base branch -> create a kiro/<requestId> branch and work -> push"; it does not merge. The base is passed to run-microvm as the base branch (`--base-branch`).
+- The author of the implementation commits made on the MicroVM is set at deploy time (`kiro-bot <kiro-bot@users.noreply.github.com>` when unspecified; see the README section on configuring the commit author). The pipeline and individual runs do not change it. The merge commits made by microvm-merge use the author of the local git configuration. If you want both to use the same identity, set the same author as the local one (an email tied to the GitHub account) at deploy time.
+- The review follows workflow-review.md (the user's global steering): two parallel lines, a mid-tier Claude and a mid-tier GPT, plus a mid-tier aggregation. Do not use top-tier models or high effort. Resolve model IDs from the live list of the execution environment (do not hard-code them).
 
-## ブランチ構造
+## Branch structure
 
 ```
 main
- └─ 統合ブランチ (feature/<機能名>)                          ← microvm-merge が main から作成し origin へ push
-     ├─ 先行タスク   : 統合ブランチを base に clone → kiro/<reqId> → push → 統合ブランチへマージ → origin 更新 → kiro/<reqId> 削除
-     ├─ 並列タスクA  : 更新済み統合ブランチを base に clone → kiro/<reqId> → push ┐
-     ├─ 並列タスクB  : 同上                                                       ├ 全完了後に順次マージ → 各 kiro/<reqId> 削除
-     └─ 並列タスクC  : 同上                                                       ┘
-     (全並列マージ後) 統合ブランチ全体をまとめてマルチモデルレビュー
-     ├─ 指摘対応     : 指摘があれば MicroVM が新規 kiro/<reqId2> で修正 → push → マージ → kiro/<reqId2> 削除 → 再レビュー (max 3)
- → APPROVED になったら 統合ブランチ → main の PR を作成
+ └─ integration branch (feature/<feature-name>)                 <- created from main by microvm-merge and pushed to origin
+     ├─ lead task      : clone with the integration branch as base -> kiro/<reqId> -> push -> merge into the integration branch -> update origin -> delete kiro/<reqId>
+     ├─ parallel task A: clone with the updated integration branch as base -> kiro/<reqId> -> push ┐
+     ├─ parallel task B: same as above                                                              ├ merge one by one after all finish -> delete each kiro/<reqId>
+     └─ parallel task C: same as above                                                              ┘
+     (after all parallel merges) multi-model review of the whole integration branch
+     ├─ fix-up         : if there are findings, MicroVM fixes them on a new kiro/<reqId2> -> push -> merge -> delete kiro/<reqId2> -> re-review (max 3)
+ -> once APPROVED, create the PR integration branch -> main
 ```
 
-作業ブランチ kiro/<requestId> は、統合ブランチへマージして push した後に origin から削除する。確認手順と例外は `.kiro/agents/microvm-merge.md` を参照。
+A work branch kiro/<requestId> is deleted from origin after it has been merged into the integration branch and pushed. See `.kiro/agents/microvm-merge.md` for the confirmation steps and the exceptions.
 
-**統合ブランチの命名**: 依頼内容(機能)が分かる名前。例 `feature/user-auth`。`microvm-pipeline` 等のツール名・パイプライン名キーワードは入れない。機能名は作業分解ステップで依頼から決める。
+**Naming the integration branch**: a name that tells what the request (feature) is. Example: `feature/user-auth`. Do not include tool or pipeline names such as `microvm-pipeline`. The feature name is decided from the request in the decomposition step.
 
-## レビューと指摘対応の方針(確定事項)
+## Review and finding-handling policy (confirmed decisions)
 
-- **レビューのタイミング**: 並列タスクを個別にレビューしない。**全並列タスクを統合ブランチにマージし終えてから、統合ブランチ全体(main との diff)を 1 回だけ**まとめてマルチモデルレビューする。先行タスクも統合ブランチに含まれるので一括で見る。タスク横断の整合性もここで見る。
-- **指摘対応は常に新規ブランチで MicroVM**: 集約 verdict が APPROVED でなく、ユーザーが「直す」と判断した指摘は、MicroVM で修正する。修正は**必ず新しい kiro/<requestId> を切る**(既存ブランチは使い回さない)。修正対象の最新統合ブランチを BASE_BRANCH にして clone させ、指摘の要点(対象ファイル・直す内容)を PROMPT に渡す。push 後、microvm-merge が統合ブランチへマージして再レビューする。
-- **ループ上限**: レビュー→指摘対応の実装ループは maxIterations 3。3 周で APPROVED に至らなければ onMaxIterations で pause。
-- **集約後はユーザー判断を仰ぐ**: 集約 verdict が APPROVED でない周は、自動で次の指摘対応へ回さず、send_message(severity=warning) で pause し、集約結果(blocking/non-blocking、各指摘の対象ファイルと概要、アグリゲーターが rejected と判断した指摘はその理由)を提示してユーザーに「対応/却下/見送り」を仰ぐ。APPROVED なら pause せず PR へ進む。
-- **確定仕様と矛盾する指摘は reject**: 集約ステップは各指摘が今回のブランチの変更に対するものか(base からの diff か)を検証し、確定方針・設計と矛盾する指摘は rejected 理由を付けて残す(握り潰さず残す)。
+- **Review timing**: do not review the parallel tasks individually. **After all parallel tasks have been merged into the integration branch, review the whole integration branch (the diff against main) exactly once** with the multi-model review. The lead task is part of the integration branch, so it is reviewed together. Consistency across tasks is checked here.
+- **Fixes always go on a new branch, on MicroVM**: findings for which the aggregated verdict is not APPROVED and the user decides "fix" are fixed on a MicroVM. A fix **must always create a new kiro/<requestId>** (never reuse an existing branch). Use the latest integration branch to be fixed as the base branch, have it cloned, and give the gist of the findings (target files and what to change) in the PROMPT. After the push, microvm-merge merges it into the integration branch and the review runs again.
+- **Loop limit**: the review -> fix implementation loop has maxIterations 3. If it does not reach APPROVED in 3 rounds, pause with onMaxIterations.
+- **Ask the user after aggregation**: in a round where the aggregated verdict is not APPROVED, do not automatically move to the next fix; pause with send_message(severity=warning), present the aggregated result (blocking/non-blocking, the target file and summary of each finding, and the reason for any finding the aggregator judged rejected), and ask the user to choose "fix / reject / defer". If APPROVED, do not pause and go to the PR.
+- **Reject findings that contradict confirmed specifications**: the aggregation step verifies whether each finding concerns the changes of this branch (the diff from base), and keeps the findings that contradict the confirmed policy or design with a rejection reason (do not bury them; keep them).
 
-## 手順
+## Procedure
 
-### 1. 入力をユーザーに聞く
+### 1. Ask the user for the inputs
 
-- **AWS_PROFILE**(必須): 使用する AWS プロファイル名。既定値を仮定せず必ず聞く(公開前提でフォールバックを置かない)。workflowPrompt に明記し、各 MicroVM 実行ステップへ `AWS_PROFILE=<profile>` として渡す。
-- **REPO_URL**(必須): 対象リポジトリ(https://github.com/owner/repo.git)。
-- **依頼内容**(必須): 実装させたい作業の全体像。
-- base は既定 main(統合ブランチの派生元)。別の派生元が必要なら聞く。
+- **AWS_PROFILE** (required): the AWS profile name to use. Never assume a default; always ask (no fallback, for public release). State it in the workflowPrompt and pass it to each MicroVM execution step as `AWS_PROFILE=<profile>`.
+- **REPO_URL** (required): the target repository (https://github.com/owner/repo.git).
+- **Request** (required): the overall picture of the work to implement.
+- The base defaults to main (the branch the integration branch is created from). Ask if another origin is needed.
 
-### 2. 1 本の workflow を組んで起動する
+### 2. Assemble and start one workflow
 
-run_workflow の workflowPrompt に 1 本のパイプラインを記述して起動する。先頭の split の結果で後続を `replace_remaining` により動的生成する(生成は microvm-split が行う)。各ステップは次の専用エージェントを使う。ルール本文は各エージェント定義にあり、workflowPrompt には書き写さない。
+Describe one pipeline in the workflowPrompt of run_workflow and start it. The result of the leading split step is used to generate the following steps dynamically through `replace_remaining` (microvm-split does the generation). Each step uses the dedicated agent below. The rule text lives in each agent definition; do not copy it into the workflowPrompt.
 
-| ステップ | 担当エージェント |
+| Step | Responsible agent |
 | --- | --- |
 | split | microvm-split |
 | setup | microvm-merge |
-| lead(先行タスクがある場合) | microvm-run → microvm-merge |
-| parallel(join allSettled、最大 3) | microvm-run |
+| lead (if there is a lead task) | microvm-run -> microvm-merge |
+| parallel (join allSettled, max 3) | microvm-run |
 | merge-all | microvm-merge |
-| review | semantic_reviewer × 2(Claude 中量級 / GPT 中量級)+ wf-review-aggregator |
-| fix-loop(maxIterations 3) | microvm-run → microvm-merge → 再レビュー |
+| review | semantic_reviewer x 2 (mid-tier Claude / mid-tier GPT) + wf-review-aggregator |
+| fix-loop (maxIterations 3) | microvm-run -> microvm-merge -> re-review |
 | pr | microvm-pr |
 
-workflowPrompt に必ず含める事項:
-- ラン固有の値: AWS_PROFILE、REPO_URL、依頼内容、base(既定 main)。
-- 各ステップは上表の専用エージェントを使うこと。
-- レビュー方針の要点: 全並列マージ後に 1 回、Claude 中量級 + GPT 中量級 + 中量級集約(モデル ID は生きた一覧から解決、ハードコード不可)。指摘対応は常に新規ブランチで MicroVM、maxIterations 3、APPROVED でない周は pause してユーザー判断。確定仕様と矛盾する指摘は rejected 理由を付けて残す。
-- 成果物の地の文は日本語。コミットは Conventional Commits 一行。
+Always include in the workflowPrompt:
+- Run-specific values: AWS_PROFILE, REPO_URL, the request, and the base (default main).
+- Each step uses the dedicated agent in the table above.
+- The gist of the review policy: once after all parallel merges, mid-tier Claude + mid-tier GPT + mid-tier aggregation (model IDs resolved from the live list, never hard-coded). Fixes always go on a new branch on MicroVM, maxIterations 3, pause and ask the user in a round that is not APPROVED. Keep findings that contradict confirmed specifications with a rejection reason.
+- Language of the pipeline artifacts: the prose of artifacts is written in Japanese. Commits are a single-line Conventional Commits message (in Japanese). PR bodies are written in Japanese.
 
-### 3. pause 時の仲介(あなた)
+### 3. Mediation when paused (you)
 
-workflow が send_message(warning) で pause したら、内容に応じてユーザーに仲介する:
+When the workflow pauses with send_message(warning), mediate to the user according to the content:
 
-- **先行/並列/指摘対応の MicroVM 実行が ok=false・push 失敗・未実行(認証切れ等)**: 事実を提示し、リトライ/中止/手動対応の判断を仰ぐ。勝手に突き進まない。
-- **レビュー集約が APPROVED でない**: 集約結果(blocking/non-blocking、各指摘の対象ファイルと概要、rejected 判断とその理由)を提示し、各指摘を「対応/却下/見送り」に切り分けてもらう。
-  - 「対応」: update_workflow で fix-loop を継続(extend_repeat または resume)。次周の修正 MicroVM run に「どの指摘を直し、どれを却下/見送るか」を明示して渡す。却下・見送りは review の該当 finding に status=rejected / rejectionReason を残す方針を伝える。
-  - 「対応不要(誤認/non-blocking)」: update_status でループを completed にして pr ステップへ進める。
-- **maxIterations 到達**: 残る指摘を要約し、もう 1 周回すか(extend_repeat)、指摘を残したまま終える(update_status completed)かをユーザーに確認する。verdict を勝手に APPROVED に書き換えない。
+- **A MicroVM run of the lead / parallel / fix step has ok=false, a failed push, or did not run (expired credentials, etc.)**: present the facts and ask the user to choose retry, abort or manual handling. Do not push ahead on your own.
+- **The review aggregation is not APPROVED**: present the aggregated result (blocking/non-blocking, the target file and summary of each finding, the rejected judgements and their reasons) and ask the user to sort each finding into "fix / reject / defer".
+  - "Fix": continue the fix-loop with update_workflow (extend_repeat or resume). In the next round's fixing MicroVM run, state explicitly which findings to fix and which to reject or defer. Tell the workflow that rejected or deferred findings should be left in the matching review finding with status=rejected / rejectionReason.
+  - "No action needed (misjudgement / non-blocking)": complete the loop with update_status and proceed to the pr step.
+- **maxIterations reached**: summarize the remaining findings and ask the user whether to run one more round (extend_repeat) or to finish with the findings left (update_status completed). Do not rewrite the verdict to APPROVED on your own.
 
-## 注意
+## Notes
 
-- 失敗(ok=false・push 失敗・未実行・非自明な競合)やレビュー未承認で自動的に突き進まない。必ず pause してユーザーに判断を仰ぐ。
-- 全工程を 1 つの run_workflow に収める。フェーズごとに別々の run_workflow を起動しない。
-- マージ先は常に統合ブランチ。main 直には入れない(最後は PR 経由)。
-- 順次マージで競合した場合の扱いは microvm-merge の定義に従う。非自明な競合の判断はユーザーに仰ぐ。
-- run.sh / run-microvm skill の挙動に合わせる。それらが変わったら専用エージェント定義と本スキルも追従する。
+- Do not push ahead automatically on a failure (ok=false, failed push, not run, non-trivial conflict) or an unapproved review. Always pause and ask the user to decide.
+- Keep the whole process in a single run_workflow. Do not start a separate run_workflow for each phase.
+- The merge target is always the integration branch. Never merge directly into main (the final step goes through a PR).
+- Follow the microvm-merge definition for conflicts during sequential merges. Ask the user to decide non-trivial conflicts.
+- Keep this skill aligned with the behavior of the `kiro-microvm` CLI and the run-microvm skill. If they change, follow with the dedicated agent definitions and this skill.
