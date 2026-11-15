@@ -861,6 +861,15 @@ class TestJsonAndDefaultDir(unittest.TestCase):
         data = json.loads(out)
         self.assertEqual([r["requestId"] for r in data], ["req-j-1"])
 
+    def test_results_dir_option_expands_tilde(self):
+        home = os.path.dirname(self.results_dir)
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            code, out = self._run_main(
+                ["list", "--json", "--results-dir", "~/" + os.path.basename(self.results_dir)]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(json.loads(out)), 1)
+
     def test_default_results_dir_from_env(self):
         with mock.patch.dict(os.environ, {"KIRO_MICROVM_RESULTS_DIR": self.results_dir}):
             self.assertEqual(loader.default_results_dir(), os.path.abspath(self.results_dir))

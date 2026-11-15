@@ -12,6 +12,7 @@ the `aws` CLI via subprocess; boto3 is not used.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -44,6 +45,25 @@ class _Terminated(BaseException):
     """Raised from the SIGTERM handler so cleanup in `finally` runs."""
 
 
+class _Deferred:
+    pending: BaseException | None = None
+
+
+@contextlib.contextmanager
+def _defer_signals():
+    """Hold SIGINT/SIGTERM until the block ends; record the first one."""
+    state = _Deferred()
+    def handler(signum, frame):
+        if state.pending is None:
+            state.pending = KeyboardInterrupt() if signum == signal.SIGINT else _Terminated()
+    old = {s: signal.signal(s, handler) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield state
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
 def log(message: str) -> None:
     print(f"[run] {message}", file=sys.stderr, flush=True)
 
@@ -58,6 +78,13 @@ def validate_request_id(request_id: str) -> str:
     if not _REQUEST_ID_RE.fullmatch(request_id) or ".." in request_id:
         raise RunError(
             f"Invalid request ID '{request_id}'. Use letters, digits, '.', '_' and '-' only."
+        )
+    # The image derives the branch name kiro/<requestId>. A trailing '-' is
+    # stripped there, and a trailing '.' or '.lock' is not a valid Git ref.
+    if request_id.endswith(("-", ".", ".lock")):
+        raise RunError(
+            f"Invalid request ID '{request_id}'. It must not end with '-', '.' or '.lock' "
+            "(the branch name kiro/<requestId> would change or be invalid)."
         )
     return request_id
 
@@ -96,10 +123,13 @@ class Aws:
     def __init__(self, profile: str, region: str):
         self.base = ["aws", "--profile", profile, "--region", region]
 
-    def call(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def call(
+        self, *args: str, check: bool = True, isolate: bool = False
+    ) -> subprocess.CompletedProcess:
         cmd = self.base + list(args)
+        extra = {"start_new_session": True} if isolate else {}
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, **extra)
         except FileNotFoundError:
             raise RunError("The 'aws' CLI was not found in PATH.")
         if check and proc.returncode != 0:
@@ -107,8 +137,8 @@ class Aws:
             raise RunError(f"aws {' '.join(args[:2])} failed (exit {proc.returncode}): {detail}")
         return proc
 
-    def text(self, *args: str) -> str:
-        return (self.call(*args).stdout or "").strip()
+    def text(self, *args: str, isolate: bool = False) -> str:
+        return (self.call(*args, isolate=isolate).stdout or "").strip()
 
     def ok(self, *args: str) -> bool:
         try:
@@ -164,11 +194,32 @@ def execute(cfg, prompt, repo_url, base_branch, request_id, as_json) -> int:
         fd, tmp_path = tempfile.mkstemp()
         with os.fdopen(fd, "wb") as f:
             f.write(prompt.encode("utf-8"))
-        aws.call(
+        # Reject a reused request ID: any object under <requestId>/ means an
+        # earlier run owns it (its status.json would be mistaken for ours).
+        used = aws.text(
+            "s3api", "list-objects-v2", "--bucket", bucket,
+            "--prefix", f"{request_id}/", "--max-items", "1",
+            "--query", "Contents[0].Key", "--output", "text",
+        )
+        if not _unset(used) or os.path.exists(os.path.join(cfg.results_dir, request_id)):
+            raise RunError(
+                f"Request ID '{request_id}' was already used. Choose a new --request-id."
+            )
+        # --if-none-match makes the reservation atomic: a concurrent run with
+        # the same ID fails here instead of overwriting the prompt.
+        proc = aws.call(
             "s3api", "put-object", "--bucket", bucket, "--key", prompt_key,
             "--body", tmp_path, "--content-type", "text/markdown; charset=utf-8",
-            "--tagging", "kind=input",
+            "--tagging", "kind=input", "--if-none-match", "*",
+            check=False,
         )
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip()
+            if "PreconditionFailed" in detail or "ConditionalRequestConflict" in detail:
+                raise RunError(
+                    f"Request ID '{request_id}' was already used. Choose a new --request-id."
+                )
+            raise RunError(f"aws s3api put-object failed (exit {proc.returncode}): {detail}")
         prompt_put = True
         os.unlink(tmp_path)
         tmp_path = None
@@ -183,17 +234,23 @@ def execute(cfg, prompt, repo_url, base_branch, request_id, as_json) -> int:
 
         # /run starts Kiro in the background and returns at once. Kiro keeps
         # running while the MicroVM is alive and puts status.json when done.
-        microvm_id = aws.text(
-            "lambda-microvms", "run-microvm",
-            "--image-identifier", image_arn,
-            "--execution-role-arn", role_arn,
-            "--egress-network-connectors", json.dumps([egress_arn]),
-            "--run-hook-payload", payload,
-            "--maximum-duration-in-seconds", str(MAX_DURATION_SECONDS),
-            "--query", "microvmId", "--output", "text",
-        )
+        # Signals are deferred while the VM is being created, so microvm_id is
+        # always captured and the `finally` below can terminate the VM.
+        with _defer_signals() as deferred:
+            microvm_id = aws.text(
+                "lambda-microvms", "run-microvm",
+                "--image-identifier", image_arn,
+                "--execution-role-arn", role_arn,
+                "--egress-network-connectors", json.dumps([egress_arn]),
+                "--run-hook-payload", payload,
+                "--maximum-duration-in-seconds", str(MAX_DURATION_SECONDS),
+                "--query", "microvmId", "--output", "text",
+                isolate=True,
+            )
         # From here prompt.md is the VM's real input, so it is no longer removed.
         prompt_put = False
+        if deferred.pending is not None:
+            raise deferred.pending
         log(f"microvm={microvm_id}")
 
         status_key = f"{prefix}status.json"

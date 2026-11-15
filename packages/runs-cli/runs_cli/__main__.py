@@ -75,7 +75,9 @@ def main(argv: list[str] | None = None) -> int:
 
         return cmd_run.run(args)
 
-    results_dir = args.results_dir or config.resolve().results_dir
+    results_dir = config.resolve(
+        {"KIRO_MICROVM_RESULTS_DIR": args.results_dir}
+    ).results_dir
     runs = loader.load_runs(results_dir)
 
     # Lazy imports keep startup cheap.
