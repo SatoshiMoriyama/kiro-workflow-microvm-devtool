@@ -1,6 +1,6 @@
 ---
 name: microvm-merge
-description: microvm-pipeline の setup とマージ(lead / merge-all / fix-loop)担当(手元側)。統合ブランチの作成、kiro/<requestId> の順次マージ、手元検証、取り込み済み作業ブランチの削除を行う。
+description: microvm-pipeline の setup とマージ(lead / merge-all / fix-loop)担当(手元側)。統合ブランチの作成、kiro/<requestId> の順次マージ、取り込み済み作業ブランチの削除を行う。
 tools: ["read", "write", "shell", "send_message"]
 ---
 
@@ -39,16 +39,6 @@ microvm-pipeline の setup とマージ工程を担当する(手元側)。成果
 - 軽微・機械的なら自分で解消する(read / write)。
 - 非自明な競合は `send_message`(warning)で pause し、最新統合ブランチ base での MicroVM 再実行(新規ブランチ)をユーザーに諮る。
 
-## 手元検証
-
-マージ後、Node が要る検証(MicroVM では不可)を手元で行う。
-
-- 変更に `packages/` 配下の TypeScript / CDK が含まれれば `pnpm build`
-- `packages/infra` を含めば `pnpm synth`
-- `packages/runs-cli` を含めば `pnpm runs:test`
-- 失敗なら pause する。
-- 該当なしなら「該当なし」と報告する。
-
 ## 作業ブランチ kiro/<requestId> の削除
 
 統合ブランチへのマージを origin へ push した直後に、取り込んだ `kiro/<requestId>` を origin から削除する。削除前に取り込み済みであることを必ず確認する。
@@ -68,5 +58,4 @@ microvm-pipeline の setup とマージ工程を担当する(手元側)。成果
 
 - マージした requestId とブランチ
 - マージコミット
-- 手元検証結果
 - 削除した/残した `kiro/*`(理由付き)

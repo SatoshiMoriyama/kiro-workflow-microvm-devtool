@@ -12,6 +12,22 @@ RUN { dnf install -y python3 awscli-2 git unzip tar ca-certificates \
       || dnf install -y python3 awscli git unzip tar ca-certificates; } \
     && dnf clean all
 
+# Node 22 と pnpm(MicroVM 内で pnpm install / tsc --noEmit / cdk synth を実行するため。issue #16)。
+# 選定理由:
+# - Node: AL2023 公式リポジトリの nodejs22(+ npm)を dnf で入れる。ARM_64 向けビルドが
+#   提供され、AL2023 の glibc 2.34 とリンクが一致し、既存の dnf 層と同じ経路で署名検証・更新が効く。
+#   公式バイナリ tar は取得 URL・チェックサム・展開先の管理が増えるため採らない。
+#   nodejs22 が引けない版のベースでは、公式 linux-arm64 tar(glibc 2.28 以上で動作)へ切り替える。
+# - pnpm: ルート package.json の packageManager(pnpm@12.10.1)に合わせ npm -g で版固定して入れる。
+#   corepack は Node 25 以降で同梱されなくなる方向で、初回実行時にネットワーク取得が走って
+#   スナップショット後の挙動が不安定になりうるため使わない。
+# 別 RUN にして、既存の python3/awscli 層のキャッシュと失敗切り分けを保つ。
+ARG PNPM_VERSION=12.10.1
+RUN dnf install -y nodejs22 nodejs22-npm \
+    && dnf clean all \
+    && npm install -g "pnpm@${PNPM_VERSION}" \
+    && npm cache clean --force
+
 # kiro-cli の配布 URL(既定値集約用の定数)。
 # AL2023 の glibc は 2.34 で、gnu ビルドの要求 2.39 に満たないため musl ビルドを使う
 # (install.sh の glibc 検査を静的リンクで回避できる)。
