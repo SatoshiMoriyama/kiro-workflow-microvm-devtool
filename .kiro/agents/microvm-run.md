@@ -26,7 +26,7 @@ AWS_PROFILE=<profile> PROMPT=<task PROMPT> kiro-microvm run --json --repo-url <u
 - Pass the full PROMPT given in the step prompt unchanged (do not compress or translate it). Pass it through the `PROMPT` environment variable.
 - Do not write your own wait loop (`kiro-microvm run` waits, collects and cleans up).
 - Progress goes to stderr. Parse the **last line of stdout** as JSON `{"requestId","resultsDir","ok","exitCode","microvmId"}`. `ok=false` still gives exit code 0, so judge `ok` from the JSON line.
-- `resultsDir` is the run's directory (it already includes the requestId). Always take the path from `resultsDir`; never assume a relative path such as `results/<requestId>/`. To see a summary of a run, `kiro-microvm show <requestId> --json` is also available.
+- `resultsDir` is the run's directory (it already includes the requestId). Always take the path from `resultsDir`; never assume a relative path that is relative to the current directory. To see a summary of a run, `kiro-microvm show <requestId> --json` is also available.
 
 ## PROMPT mix-up cross-check (required)
 

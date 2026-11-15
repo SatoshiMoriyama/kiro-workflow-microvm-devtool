@@ -58,7 +58,7 @@ AWS_PROFILE=<profile> PROMPT="<the work requested by the user>" kiro-microvm run
 - `kiro-microvm run` generates the requestId, puts the PROMPT at the input key `<requestId>/inputs/prompt.md`, builds the payload (it carries `promptKey`, not the text), starts the VM, runs kiro-cli in the background through the `/run` hook, polls S3 for `status.json`, downloads the results into `resultsDir`, and terminates the VM. Do not write your own wait loop for waiting, collection or cleanup.
 - Before sending the payload to the VM, the CLI **validates the JSON payload size against 4096 bytes** and stops with a clear error message if it is exceeded (normally it is not, because the PROMPT goes via S3; if it is, another field such as the repo URL is oversized. Do not put the text back into the payload).
 - **The exit code of `kiro-microvm run` is 0 even when `ok` is false.** Do not rely on the exit code; the caller judges `ok` from the JSON line.
-- `resultsDir` is the directory of this run (it already includes the requestId). The default location is under `~/.local/share/kiro-microvm/results/` (overridable with `KIRO_MICROVM_RESULTS_DIR`). Always take the path from `resultsDir` in the JSON line; never assume a relative path such as `results/<requestId>/`.
+- `resultsDir` is the directory of this run (it already includes the requestId). The default location is under `~/.local/share/kiro-microvm/results/` (overridable with `KIRO_MICROVM_RESULTS_DIR`). Always take the path from `resultsDir` in the JSON line; never assume a relative path that is relative to the current directory.
 
 ### 3. Triage failures (report them as they are)
 

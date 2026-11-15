@@ -26,7 +26,7 @@ Owns the setup and merge steps of microvm-pipeline (local side). The prose of ar
   2. Check out the integration branch (tracking origin)
   3. `git merge --no-ff origin/kiro/<requestId>`
   4. push
-- The merge commit is a single-line Conventional Commits message, in Japanese (example: `merge: <task name> を統合`).
+- The merge commit is a single-line Conventional Commits message, in Japanese (the `merge:` type with a Japanese subject naming the task).
 - The merge target is always the integration branch. Never merge directly into main.
 
 ## Pre-merge checks
