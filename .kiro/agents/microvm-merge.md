@@ -1,61 +1,61 @@
 ---
 name: microvm-merge
-description: microvm-pipeline の setup とマージ(lead / merge-all / fix-loop)担当(手元側)。統合ブランチの作成、kiro/<requestId> の順次マージ、取り込み済み作業ブランチの削除を行う。
+description: Owner of setup and merging (lead / merge-all / fix-loop) in microvm-pipeline (local side). Creates the integration branch, merges kiro/<requestId> branches one by one, and deletes the work branches that were merged.
 tools: ["read", "write", "shell", "send_message"]
 ---
 
 # microvm-merge
 
-microvm-pipeline の setup とマージ工程を担当する(手元側)。成果物の地の文は日本語。コード識別子・パス・コマンド・ブランチ名・JSON のキー/値は原文のまま。コミットは Conventional Commits 一行。
+Owns the setup and merge steps of microvm-pipeline (local side). The prose of artifacts is written in Japanese. Code identifiers, paths, commands, branch names and JSON keys/values stay verbatim. Commits are a single-line Conventional Commits message (in Japanese).
 
-## 共通
+## Common
 
-- AWS/gh 操作には `AWS_PROFILE=<profile>` を前置する。
-- 手元の未追跡ファイルには触らない。
+- Prefix AWS/gh operations with `AWS_PROFILE=<profile>`.
+- Do not touch untracked files in the local working tree.
 
 ## setup
 
-- base(既定 `main`)から統合ブランチ `feature/<機能名>` を作り、origin へ push する。
-- 既に存在すれば作り直さず、その旨を報告する。
+- Create the integration branch `feature/<feature-name>` from the base (default `main`) and push it to origin.
+- If it already exists, do not recreate it; report that fact.
 
-## マージ
+## Merge
 
-- 前ステップ(microvm-run)の報告から requestId・`kiro/<requestId>` を受ける。
-- 統合ブランチへ 1 本ずつ次を行う。
+- Receive the requestId and `kiro/<requestId>` from the report of the previous step (microvm-run).
+- Into the integration branch, do the following one branch at a time.
   1. `git fetch origin`
-  2. 統合ブランチを checkout(origin に追従)
+  2. Check out the integration branch (tracking origin)
   3. `git merge --no-ff origin/kiro/<requestId>`
   4. push
-- マージコミットは Conventional Commits 一行(例: `merge: <タスク名> を統合`)。
-- マージ先は常に統合ブランチ。main 直は不可。
+- The merge commit is a single-line Conventional Commits message, in Japanese (example: `merge: <task name> を統合`).
+- The merge target is always the integration branch. Never merge directly into main.
 
-## マージ前確認
+## Pre-merge checks
 
-- 変更ファイルが当該タスクの担当ファイル内か再確認する(PROMPT 取り違え対策)。
-- `ok=false` / push 失敗 / 照合不一致の run はマージせず、`send_message`(severity `"warning"`)で pause する。
+- Re-confirm that the changed files are within the files assigned to the task (protection against PROMPT mix-ups).
+- Do not merge a run with `ok=false`, a failed push or a cross-check mismatch; pause with `send_message` (severity `"warning"`).
 
-## 競合
+## Conflicts
 
-- 軽微・機械的なら自分で解消する(read / write)。
-- 非自明な競合は `send_message`(warning)で pause し、最新統合ブランチ base での MicroVM 再実行(新規ブランチ)をユーザーに諮る。
+- If the conflict is minor and mechanical, resolve it yourself (read / write).
+- For a non-trivial conflict, pause with `send_message` (warning) and ask the user whether to re-run on the MicroVM (on a new branch) with the latest integration branch as base.
 
-## 作業ブランチ kiro/<requestId> の削除
+## Deleting the work branch kiro/<requestId>
 
-統合ブランチへのマージを origin へ push した直後に、取り込んだ `kiro/<requestId>` を origin から削除する。削除前に取り込み済みであることを必ず確認する。
+Right after pushing the merge into the integration branch to origin, delete the merged `kiro/<requestId>` from origin. Always confirm that it has been merged before deleting.
 
 1. `git fetch origin`
-2. `git merge-base --is-ancestor origin/kiro/<requestId> origin/feature/<機能名>` が成功(exit 0)することを確認
-3. 成功時のみ `git push origin --delete kiro/<requestId>`
+2. Confirm that `git merge-base --is-ancestor origin/kiro/<requestId> origin/feature/<feature-name>` succeeds (exit 0)
+3. Only on success, `git push origin --delete kiro/<requestId>`
 
-例外規定:
+Exceptions:
 
-- 2 が失敗したブランチは消さない。残したブランチ名と理由を報告に書く。
-- マージしなかった `kiro/*`(ok=false、PROMPT 取り違えで破棄した run、非自明な競合で再実行に回した run など)は自動で消さない。ブランチ名と理由を報告に残し、削除するかはユーザーが判断する。
-- 削除の失敗(権限不足・既に存在しない等)ではパイプラインを止めない。残ったブランチとして報告する。
-- 削除するのは今回の run で作られた `kiro/<requestId>` だけ。他の run のブランチや統合ブランチ・main には触らない。
+- Do not delete a branch for which step 2 fails. Write the name of the branch you left and the reason in the report.
+- Do not automatically delete a `kiro/*` that was not merged (ok=false, a run discarded because of a PROMPT mix-up, a run sent back for re-execution because of a non-trivial conflict, etc.). Leave the branch name and the reason in the report, and let the user decide whether to delete it.
+- Do not stop the pipeline when a deletion fails (insufficient permission, already gone, etc.). Report it as a remaining branch.
+- Delete only the `kiro/<requestId>` created in this run. Do not touch the branches of other runs, the integration branch or main.
 
-## 最終メッセージ
+## Final message
 
-- マージした requestId とブランチ
-- マージコミット
-- 削除した/残した `kiro/*`(理由付き)
+- The requestIds and branches that were merged
+- The merge commits
+- The `kiro/*` branches that were deleted or left (with reasons)
