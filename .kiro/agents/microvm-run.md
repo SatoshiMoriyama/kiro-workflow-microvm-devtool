@@ -40,7 +40,11 @@ AWS_PROFILE=<profile> REPO_URL=<url> BASE_BRANCH=<統合ブランチ> PROMPT=<�
 
 ## Node 系検証
 
-MicroVM に Node が無いため、Node 系検証(`tsc` / `cdk synth` 等)が未実施でも失敗扱いしない。報告に「手元検証が必要」と書く。
+MicroVM には Node と pnpm が入っている。タスク PROMPT に従い、MicroVM 内で検証(`pnpm install`、`pnpm --filter infra exec tsc --noEmit`、可能なら `cdk synth`)を実行させ、実行したコマンドと結果を `report.md` に記録させる。
+
+- 回収した `report.md` で検証結果を確認し、最終メッセージに転記する。
+- 検証が失敗した場合は `ok=false` と同じ扱いにする(「失敗時」の節に従い、`send_message`(severity `"warning"`)で報告して pause する)。
+- `cdk synth` のみ、通らない理由が `report.md` に記録されていれば失敗扱いにしない。
 
 ## 失敗時
 
@@ -57,6 +61,7 @@ MicroVM に Node が無いため、Node 系検証(`tsc` / `cdk synth` 等)が未
 - push 先ブランチ `kiro/<requestId>`
 - pushedCommit
 - creditsUsed
+- 検証結果(`report.md` の記載)
 - `results/<requestId>/` のパスと `report.md` / `report.json` の有無
 - 照合結果
 - 破棄した run があれば、その requestId とブランチ

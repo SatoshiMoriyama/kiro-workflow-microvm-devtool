@@ -30,9 +30,12 @@ microvm-pipeline の split ステップを担当する planner。成果物の地
 ## タスク PROMPT の書き方
 
 - 日本語で詳細に書いてよい(S3 経由で渡るので 4096 バイト制限は気にしない)。
-- MicroVM イメージに Node が無いため、`tsc` / `pnpm build` / `cdk synth` 等 Node が要る検証を PROMPT で要求しない。
-- `python3`・`git` で可能な検証だけ書く。
-- Node 系検証はマージ後に手元(microvm-merge)で行う旨を PROMPT に書く。
+- MicroVM イメージには Node と pnpm が入っているため、PROMPT に MicroVM 内で行う検証を含める。
+  - `pnpm install`
+  - `pnpm --filter infra exec tsc --noEmit`
+  - 可能なら `cdk synth`
+- `cdk synth` が通らない場合は、その理由を `report.md` に記録するよう PROMPT に書く。
+- 検証結果(実行したコマンドと成否)を `report.md` に記録するよう PROMPT に書く。
 
 ## 承認フロー
 
