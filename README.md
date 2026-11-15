@@ -17,7 +17,7 @@ GitHub リポジトリを clone してブランチを切り、Kiro が作業し�
 │  │  ├─ bin/infra.ts
 │  │  └─ lib/microvm-stack.ts
 │  ├─ image/                    # MicroVM イメージの中身(code artifact)
-│  │  ├─ Dockerfile             # al2023-minimal + awscli + kiro-cli(musl) + Python フックサーバ
+│  │  ├─ Dockerfile             # al2023-minimal + awscli + Node 22 + pnpm + kiro-cli(musl) + Python フックサーバ
 │  │  ├─ hook_server.py         # /ready に 200、/run で Kiro CLI 実行 -> 成果物+status.json を S3 に put
 │  │  ├─ steering/              # MicroVM 内 kiro-cli 用グローバル steering(手元 Kiro IDE には無関係)
 │  │  └─ test_hook_server.py    # hook_server の純関数ユニットテスト
@@ -40,7 +40,7 @@ GitHub リポジトリを clone してブランチを切り、Kiro が作業し�
 
 - AWS CLI 2.38+（`lambda-microvms` サブコマンド）。確認済み: 2.39.0
 - CDK 2.1146 系 CLI / `aws-cdk-lib` 2.275.0（`CfnMicrovmImage` を含む）
-- Node 22 / pnpm 12 / Docker 稼働
+- Node 22 / pnpm 12 / Docker 稼働(手元)。MicroVM イメージにも Node 22(dnf `nodejs22`)と pnpm(`npm -g`、版は `packageManager` に合わせた 12.10.1)を入れる。
 - リージョン `ap-northeast-1`（MicroVMs 利用可を確認済み）
 - `AWS_PROFILE=work`
 
@@ -64,6 +64,14 @@ GitHub リポジトリを clone してブランチを切り、Kiro が作業し�
   - ホストポーリング上限=1860s(372×5s, `run.sh`): VM 寿命より少し長く待つ。
   - 単調関係 `KIRO_TIMEOUT_SECONDS(1200) < --maximum-duration(1800) < ホストポーリング上限(1860)` を保つ。これで「ゲスト timeout でも status.json を書ける」「VM 寿命切れ前に Kiro 完了」「ポーリングが VM 寿命より先に諦めない」を同時に満たす。
 - **メモリ**: `minimumMemoryInMiB=2048`。Rust 製 kiro-cli がコンテキスト・ツール実行・子プロセス(curl)を抱えるため、baseline を 2048 にして peak 上限(自動で最大 4x)を確保する。
+- **MicroVM 内の Node / pnpm(issue #16)**: イメージに Node 22 系(AL2023 の dnf `nodejs22` + `nodejs22-npm`)と pnpm(`npm install -g pnpm@12.10.1`、`ARG PNPM_VERSION`)を入れる。これにより GitHub フローで clone した本リポジトリのような pnpm モノレポに対し、MicroVM 内の Kiro が `pnpm install` と `pnpm --filter infra exec tsc --noEmit`(可能なら `pnpm --filter infra exec cdk synth`)を実行して自己検証できる。選定理由(dnf vs 公式 tar、npm vs corepack)は Dockerfile のコメントに記載。既存の kiro-cli・hook_server・steering の層は変更していない。反映には再デプロイ(`pnpm deploy`)が必要で、**ビルド成否は未確認**(AWS 側ビルドのため MicroVM 内では実行できず、再デプロイ後に手元で確認する)。
+- **MicroVM 内 `cdk synth` の見立て(コード読みによる調査。実行は未検証)**:
+  - `artifact-hash.txt` 不在: `packages/infra/artifact-hash.txt` は gitignore 対象で clone 直後に無いが、`image-stack.ts` は `fs.existsSync` で確認し、無ければプレースホルダキー `PLACEHOLDER-run-package-image-sh-first` を使うため **throw せず synth は通る**。ダミー hash を用意する必要は無い。ただしこの出力はデプロイ用ではない(存在しない zip を指す)。
+  - AWS 認証: `bin/infra.ts` は `env.region` を `ap-northeast-1` に固定し、`account` は `CDK_DEFAULT_ACCOUNT` 由来。`Vpc.fromLookup` 等の context lookup は無く、synth 自体に AWS API 呼び出しは不要。認証が無い場合、CDK CLI はアカウントを解決できず警告を出すが、account 未解決のスタックは environment-agnostic として synth される想定。ゲストには executionRole の短命 credential があるので、解決を試みても失敗はしにくい。
+  - 実行コスト: `cdk.json` の `app` は `npx ts-node` で、synth ごとに ts-node の型検査コンパイルが走る。`aws-cdk-lib` が大きく数十秒〜1 分程度かかりうる。tsc --noEmit 同様、依存は `pnpm install` 済みが前提。
+  - 結論: 通る見込みが高いが、`pnpm --filter infra exec cdk synth` の通過は再デプロイ後に実機で確認が要る。通らない場合の第一候補は ts-node の型検査を `TS_NODE_TRANSPILE_ONLY=1` で省く(メモリ・時間の削減)こと。
+- **メモリの見立て(未実測)**: `minimumMemoryInMiB=2048`(peak は自動で最大 4x)。kiro-cli(Rust)は常駐で数百 MiB 程度、`pnpm install` は 数百 MiB、`tsc --noEmit` は `aws-cdk-lib` の型を読むため 1 GiB 前後に達しうる。`cdk synth`(ts-node)も同程度。単独なら 2048 に収まるが、kiro-cli と同時に走らせると baseline を超えて peak 側に依存する可能性がある。OOM が出た場合は `minimumMemoryInMiB` を 4096 へ上げる(`image-stack.ts` の変更が必要。本タスクでは変更しない)か、`NODE_OPTIONS=--max-old-space-size=1536` で Node のヒープを抑える。実機での実測が必要。
+- **イメージサイズ・ビルド時間の見込み(概算・未実測)**: `nodejs22` + `nodejs22-npm` で展開後およそ 100〜150 MiB、pnpm で 数十 MiB が増える見込み。ビルド時間は dnf の取得とインストール、`npm install -g pnpm` で 1 分前後の増加を見込む。`/ready` スナップショットのサイズも同程度増えるので、起動時間への影響は再デプロイ後に確認する。
 - **完了条件**: `/run` が即 200 を返した後、`run.sh` は `status.json` の出現をポーリングで待つ(バックグラウンドの Kiro 完了後に成否に関わらず必ず出る)。`status.json` の `ok`(= `exitCode==0 && !timedOut && failedUploads なし`)と `exitCode` を表示する。
 - **認証/権限**: ゲストには executionRole の短命 credential が自動付与され、`aws s3 cp` が直接叩ける。長期キー不要。
 - **code artifact の zip** は CDK 外(`package-image.sh`)で内容ハッシュ付きキー `code/app-<hash>.zip` に置き、ハッシュを `packages/infra/artifact-hash.txt` に書き出す。`ImageStack` はそれを読んで URI を決める。zip が変わればキー(= URI)が変わるので CFN が差分を検知して再ビルドする。
