@@ -28,7 +28,7 @@ class TestPureLogic(unittest.TestCase):
 
     def test_validate_request_id(self):
         self.assertEqual(cmd_run.validate_request_id("req-1_a.b"), "req-1_a.b")
-        for bad in ("", "../x", "a/b", "a b", "-x", "a..b"):
+        for bad in ("", "../x", "a/b", "a b", "-x", "a..b", "req-1-", "req-1.", "req-1.lock"):
             with self.assertRaises(cmd_run.RunError):
                 cmd_run.validate_request_id(bad)
 
@@ -61,7 +61,11 @@ class TestPureLogic(unittest.TestCase):
 class FakeAws:
     """Records `aws` invocations and answers them like the real CLI would."""
 
-    def __init__(self, status_after=1, status_ok=True, fail_on=None):
+    def __init__(self, status_after=1, status_ok=True, fail_on=None, used_key=None,
+                 put_error=None, on_run_microvm=None):
+        self.used_key = used_key
+        self.put_error = put_error
+        self.on_run_microvm = on_run_microvm
         self.calls = []
         self.status_after = status_after  # head-object succeeds from this attempt on
         self.heads = 0
@@ -81,10 +85,16 @@ class FakeAws:
             out = "bucket-1\n" if "ResultBucketName" in " ".join(sub) else "arn:role\n"
         elif key == "lambda-microvms list-microvm-images":
             out = "arn:image\n"
+        elif key == "s3api list-objects-v2":
+            out = (self.used_key or "None") + "\n"
+        elif key == "s3api put-object" and self.put_error:
+            return subprocess.CompletedProcess(cmd, 1, "", self.put_error)
         elif key == "s3api put-object":
             with open(sub[sub.index("--body") + 1], "rb") as f:
                 self.put_body = f.read()
         elif key == "lambda-microvms run-microvm":
+            if self.on_run_microvm:
+                self.on_run_microvm()
             out = "mvm-123\n"
         elif key == "s3api head-object":
             self.heads += 1
@@ -223,6 +233,29 @@ class TestRun(unittest.TestCase):
         code, _, _ = self._run(fake)
         self.assertEqual(code, 130)
         self.assertEqual(fake.keys()[-1], "lambda-microvms terminate-microvm")
+
+    def test_used_request_id_is_rejected_before_put(self):
+        fake = FakeAws(used_key="req-test-1/runs/status.json")
+        code, _, err = self._run(fake)
+        self.assertEqual(code, 1)
+        self.assertIn("already used", err)
+        self.assertNotIn("s3api put-object", fake.keys())
+        self.assertNotIn("lambda-microvms run-microvm", fake.keys())
+
+    def test_concurrent_reservation_failure_is_rejected(self):
+        fake = FakeAws(put_error="An error occurred (PreconditionFailed) when calling PutObject")
+        code, _, err = self._run(fake)
+        self.assertEqual(code, 1)
+        self.assertIn("already used", err)
+        self.assertNotIn("lambda-microvms run-microvm", fake.keys())
+
+    def test_signal_during_launch_still_terminates_vm(self):
+        import signal as sig
+        fake = FakeAws(on_run_microvm=lambda: os.kill(os.getpid(), sig.SIGTERM))
+        code, _, _ = self._run(fake)
+        self.assertEqual(code, 143)
+        self.assertEqual(fake.keys()[-1], "lambda-microvms terminate-microvm")
+        self.assertEqual(fake.keys().count("lambda-microvms run-microvm"), 1)
 
     def test_missing_aws_cli(self):
         def boom(*a, **k):
