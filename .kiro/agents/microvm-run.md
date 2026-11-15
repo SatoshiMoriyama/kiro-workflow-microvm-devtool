@@ -43,7 +43,8 @@ AWS_PROFILE=<profile> REPO_URL=<url> BASE_BRANCH=<統合ブランチ> PROMPT=<�
 MicroVM には Node と pnpm が入っている。タスク PROMPT に従い、MicroVM 内で検証(`pnpm install`、`pnpm --filter infra exec tsc --noEmit`、可能なら `cdk synth`)を実行させ、実行したコマンドと結果を `report.md` に記録させる。
 
 - 回収した `report.md` で検証結果を確認し、最終メッセージに転記する。
-- 検証が失敗した場合は `ok=false` と同じ扱いにする(「失敗時」の節に従い、`send_message`(severity `"warning"`)で報告して pause する)。
+- タスク PROMPT が要求した検証だけを対象にする。PROMPT に無い検証(対象が pnpm プロジェクトでない場合など)が未実行でも失敗扱いにしない。
+- 要求された検証が失敗した場合は `ok=false` と同じ扱いにする(「失敗時」の節に従い、`send_message`(severity `"warning"`)で報告して pause する)。
 - `cdk synth` のみ、通らない理由が `report.md` に記録されていれば失敗扱いにしない。
 
 ## 失敗時

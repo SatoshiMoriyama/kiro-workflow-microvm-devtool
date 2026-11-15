@@ -30,13 +30,12 @@ microvm-pipeline の split ステップを担当する planner。成果物の地
 ## タスク PROMPT の書き方
 
 - 日本語で詳細に書いてよい(S3 経由で渡るので 4096 バイト制限は気にしない)。
-- MicroVM イメージには Node と pnpm が入っているため、PROMPT に MicroVM 内で行う検証を含める。
-  - `pnpm install`
-  - `pnpm --filter infra exec tsc --noEmit`
-  - 可能なら `cdk synth`
-- `cdk synth` が通らない場合は、その理由を `report.md` に記録するよう PROMPT に書く。
-- 検証結果(実行したコマンドと成否)を `report.md` に記録するよう PROMPT に書く。
-
+- MicroVM イメージには Node と pnpm が入っている。対象リポジトリの構成を確認し、該当する検証だけを PROMPT に含める(REPO_URL は任意のリポジトリになりうる)。
+  - `package.json` があり pnpm プロジェクト: `pnpm install`
+  - `infra` ワークスペースがある: `pnpm --filter infra exec tsc --noEmit`、可能なら `cdk synth`
+  - 上記に当たらない(Python 等): Node 系検証は PROMPT に含めない。そのリポジトリに合う検証(`python3` で可能なもの等)だけ書く。
+- `cdk synth` を要求した場合、通らないときはその理由を `report.md` に記録するよう PROMPT に書く。
+- 検証を要求した場合、実行したコマンドと成否を `report.md` に記録するよう PROMPT に書く。
 ## 承認フロー
 
 1. `send_message`(sessionId `"parent"`, severity `"warning"`)で分解案の要点と `split.md` のパスを提示し、ターンを終える。
