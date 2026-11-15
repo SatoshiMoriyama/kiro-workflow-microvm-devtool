@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 blog/
 .agents/
+*.egg-info/
+build/

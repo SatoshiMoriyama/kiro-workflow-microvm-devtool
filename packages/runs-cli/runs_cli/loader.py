@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""run 結果(results/ 配下)を読み込み、Run データクラスへ正規化するローダ。
+"""Loader that reads run results and normalizes them into Run dataclasses.
 
-このモジュールの公開 API(Run / load_runs / duration_seconds /
-default_results_dir)は並列タスク(cmd_list / cmd_show / cmd_stats)との
-契約であり、名前・シグネチャを厳密に維持する。
+The public API (Run / load_runs / duration_seconds / default_results_dir) is
+a contract with cmd_list / cmd_show / cmd_stats; keep names and signatures.
 """
 
 from __future__ import annotations
@@ -17,13 +16,14 @@ from datetime import datetime
 
 @dataclass
 class Run:
-    """1 つの run を表す正規化済みデータ。
+    """One normalized run.
 
-    フィールド名は並列タスクが import するため厳密に維持すること(snake_case)。
+    Keep the snake_case field names; other modules import them.
 
-    credits_used は kiro-cli の使用クレジット(単位 credit、丸めなし)。
-    status.json の creditsUsed が数値のときだけ float で入り、null・キー欠落
-    (古いラン)・数値でない値(非有限値 NaN/Infinity を含む)・broken な run では None(取得不可)となる。
+    credits_used is the kiro-cli credit usage (unit: credit, not rounded). It is
+    a float only when status.json has a numeric creditsUsed. It is None (not
+    available) for null, a missing key (old runs), non-numeric values
+    (including NaN/Infinity) and broken runs.
     """
 
     request_id: str
@@ -45,13 +45,13 @@ class Run:
 
 
 def _read_json(path: str):
-    """JSON ファイルを読む。存在しない・壊れている場合は例外を送出する。"""
+    """Read a JSON file. Raises if it is missing or malformed."""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def _parse_credits(value) -> float | None:
-    """creditsUsed を float へ正規化する。int/float(bool 除く)以外と非有限値(NaN/Infinity)は None。"""
+    """Normalize creditsUsed to float. Non-numbers (bool included) and NaN/Infinity give None."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if not math.isfinite(value):
@@ -60,7 +60,7 @@ def _parse_credits(value) -> float | None:
 
 
 def _run_from_status(request_id: str, abs_dir: str, status: dict) -> Run:
-    """status.json の dict から Run を構築する(report.json 分は未設定)。"""
+    """Build a Run from a status.json dict (report.json fields are unset)."""
     return Run(
         request_id=status.get("requestId", request_id),
         ok=status.get("ok"),
@@ -82,7 +82,7 @@ def _run_from_status(request_id: str, abs_dir: str, status: dict) -> Run:
 
 
 def _broken_run(request_id: str, abs_dir: str) -> Run:
-    """status.json が欠損・破損している場合の broken な Run を返す。"""
+    """Return a broken Run for a missing or corrupt status.json."""
     return Run(
         request_id=request_id,
         ok=None,
@@ -103,12 +103,12 @@ def _broken_run(request_id: str, abs_dir: str) -> Run:
 
 
 def load_runs(results_dir: str) -> list[Run]:
-    """results_dir 直下の各サブディレクトリを 1 run として読み込む。
+    """Load each subdirectory of results_dir as one run.
 
-    - status.json が無い/壊れている場合はクラッシュせず broken=True の Run を返す。
-    - report.json があれば branch / pushed_commit / summary を取り込む。
-      report.json が壊れている場合は status 部分を保持し report 側のみ None とする。
-    - results_dir が存在しない場合は空リストを返す。
+    - A missing or corrupt status.json yields a broken=True Run (no crash).
+    - If report.json exists, branch / pushed_commit / summary are taken from it.
+      A corrupt report.json keeps the status part and leaves only those None.
+    - A nonexistent results_dir yields an empty list.
     """
     if not os.path.isdir(results_dir):
         return []
@@ -127,8 +127,8 @@ def load_runs(results_dir: str) -> list[Run]:
             runs.append(_broken_run(name, abs_dir))
             continue
 
-        # status.json が有効 JSON でも dict でない(例 []/null/文字列)場合は
-        # status.get が AttributeError になるため broken 扱いにする。
+        # Valid JSON that is not a dict (e.g. []/null/string) would make
+        # status.get raise AttributeError, so treat it as broken.
         if not isinstance(status, dict):
             runs.append(_broken_run(name, abs_dir))
             continue
@@ -140,11 +140,11 @@ def load_runs(results_dir: str) -> list[Run]:
             try:
                 report = _read_json(report_path)
             except (ValueError, OSError):
-                # report.json が壊れている: status 部分は保持し report 側のみ None。
+                # Corrupt report.json: keep the status part, report fields stay None.
                 report = None
 
-            # report.json が dict のときだけ get で取り込む。
-            # 非 dict/壊れ時は status 側を保持し report 側のみ None とする。
+            # Only a dict report is read. Otherwise keep the status part and
+            # leave the report fields None.
             if isinstance(report, dict):
                 run.branch = report.get("branch")
                 run.pushed_commit = report.get("pushedCommit")
@@ -160,28 +160,29 @@ def load_runs(results_dir: str) -> list[Run]:
 
 
 def duration_seconds(run: Run) -> float | None:
-    """started_at と finished_at の差(秒)を返す。
+    """Return finished_at - started_at in seconds.
 
-    ISO8601(オフセット付き)を datetime.fromisoformat で解釈する。
-    いずれかが欠損/解釈不能なら None を返す。
+    Both are parsed as ISO8601 with datetime.fromisoformat. Returns None if
+    either is missing or unparsable.
     """
     if not run.started_at or not run.finished_at:
         return None
     try:
         start = datetime.fromisoformat(run.started_at)
         finish = datetime.fromisoformat(run.finished_at)
-        # tz 有無が異なる(aware と naive の混在)と減算で TypeError になるため
-        # 減算も try に含めて None にフォールバックする。
+        # Mixing aware and naive datetimes raises TypeError on subtraction, so
+        # the subtraction stays inside the try and falls back to None.
         return (finish - start).total_seconds()
     except (ValueError, TypeError):
         return None
 
 
 def default_results_dir() -> str:
-    """リポジトリルート直下の results/ の絶対パスを返す。
+    """Return the default results directory.
 
-    このファイルは packages/runs-cli/runs_cli/ にあるため、3 階層上がリポジトリルート。
+    KIRO_MICROVM_RESULTS_DIR (environment or config file), otherwise
+    ~/.local/share/kiro-microvm/results (honoring XDG_DATA_HOME).
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
-    return os.path.join(repo_root, "results")
+    from runs_cli import config
+
+    return config.resolve().results_dir
