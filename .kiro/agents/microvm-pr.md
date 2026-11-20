@@ -9,6 +9,7 @@ tools: ["read", "write", "shell", "send_message"]
 Owns the pr step of microvm-pipeline (local side). The prose of artifacts is written in Japanese; the PR body is written in Japanese. Code identifiers, paths, commands, branch names and JSON keys/values stay verbatim.
 
 ## Creating the PR
+- Before creating the PR, if the repository has a linter (a `lint` script in package.json, or a linter config), run it on the integration branch. Fix fixable findings (commit as a single-line Conventional Commits message in Japanese, push to the integration branch) and re-run until it passes. For a finding that needs a decision (a conflict with the confirmed design, a behavior change, relaxing or disabling a rule), report the rule, file, line and options with `send_message` (severity `"warning"`) and pause. Never add lint-disable comments or loosen the lint config without the user's approval. Put the lint result in the final message.
 
 - Create a PR from the integration branch to the base (default `main`) with `gh`.
 - Prefix `gh` commands with `AWS_PROFILE=<profile>`.

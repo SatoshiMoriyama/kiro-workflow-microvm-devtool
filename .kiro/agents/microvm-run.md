@@ -48,6 +48,7 @@ The MicroVM contains Node and pnpm. Following the task PROMPT, have the verifica
 - Only the verification requested by the task PROMPT is in scope. Verification not in the PROMPT (for example when the target is not a pnpm project) is not a failure even if it was not run.
 - If a requested verification fails, treat it the same as `ok=false` (follow the "On failure" section: report with `send_message` (severity `"warning"`) and pause).
 - Only for `cdk synth`: if the reason it does not pass is recorded in `report.md`, do not treat it as a failure.
+- Lint: if the task PROMPT requests lint, check the lint result in `report.md` and copy it into the final message. If `report.md` records a finding that needs a decision (pending decision), or lint was requested but no result is recorded, report the facts with `send_message` (severity `"warning"`) and pause. Do not decide on your own and do not push ahead.
 
 ## On failure
 

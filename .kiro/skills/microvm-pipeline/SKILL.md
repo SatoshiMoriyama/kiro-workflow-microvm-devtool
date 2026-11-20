@@ -54,6 +54,15 @@ A work branch kiro/<requestId> is deleted from origin after it has been merged i
 - **Ask the user after aggregation**: in a round where the aggregated verdict is not APPROVED, do not automatically move to the next fix; pause with send_message(severity=warning), present the aggregated result (blocking/non-blocking, the target file and summary of each finding, and the reason for any finding the aggregator judged rejected), and ask the user to choose "fix / reject / defer". If APPROVED, do not pause and go to the PR.
 - **Reject findings that contradict confirmed specifications**: the aggregation step verifies whether each finding concerns the changes of this branch (the diff from base), and keeps the findings that contradict the confirmed policy or design with a rejection reason (do not bury them; keep them).
 
+## Lint policy (required when the repository has a linter)
+
+- **Applies when a lint is defined**: a `lint` script in package.json, or a linter config in the repository (ESLint, Ruff, etc.). If none exists, skip and say so in the step report.
+- **When to run**: in every MicroVM implementation task (lead / parallel / fix), run lint before the final commit and push. Run it once more on the integration branch after merge-all and before the pr step.
+- **Fixable findings**: fix them (auto-fix or a direct edit) and re-run lint until it passes. Format and style violations are in this group.
+- **Findings that need a decision**: do not decide on your own. Examples: a rule that conflicts with the confirmed design, a fix that changes behavior, a rule that would need to be disabled or relaxed. Stop and ask the user (send_message severity=warning with the rule, file, line and the options).
+- **Never bypass**: do not add lint-disable comments, loosen the lint config, or skip the step to make it pass without the user's approval.
+- **Report**: each step reports the lint command, the result (pass / fixed / pending decision), and the files changed by fixes.
+
 ## Procedure
 
 ### 1. Ask the user for the inputs
@@ -82,6 +91,7 @@ Always include in the workflowPrompt:
 - Run-specific values: AWS_PROFILE, REPO_URL, the request, and the base (default main).
 - Each step uses the dedicated agent in the table above.
 - The gist of the review policy: once after all parallel merges, mid-tier Claude + mid-tier GPT + mid-tier aggregation (model IDs resolved from the live list, never hard-coded). Fixes always go on a new branch on MicroVM, maxIterations 3, pause and ask the user in a round that is not APPROVED. Keep findings that contradict confirmed specifications with a rejection reason.
+- The gist of the lint policy: if the repository has a linter, run it in every implementation task before push and on the integration branch before the pr step. Fix what can be fixed; pause with send_message(warning) for anything that needs a decision. Never bypass lint.
 - Language of the pipeline artifacts: the prose of artifacts is written in Japanese. Commits are a single-line Conventional Commits message (in Japanese). PR bodies are written in Japanese.
 
 ### 3. Mediation when paused (you)
@@ -92,6 +102,7 @@ When the workflow pauses with send_message(warning), mediate to the user accordi
 - **The review aggregation is not APPROVED**: present the aggregated result (blocking/non-blocking, the target file and summary of each finding, the rejected judgements and their reasons) and ask the user to sort each finding into "fix / reject / defer".
   - "Fix": continue the fix-loop with update_workflow (extend_repeat or resume). In the next round's fixing MicroVM run, state explicitly which findings to fix and which to reject or defer. Tell the workflow that rejected or deferred findings should be left in the matching review finding with status=rejected / rejectionReason.
   - "No action needed (misjudgement / non-blocking)": complete the loop with update_status and proceed to the pr step.
+- **A lint finding needs a decision**: present the rule, file, line and the options (fix by behavior change, relax the rule, defer) and ask the user to choose. Do not disable or relax lint on your own.
 - **maxIterations reached**: summarize the remaining findings and ask the user whether to run one more round (extend_repeat) or to finish with the findings left (update_status completed). Do not rewrite the verdict to APPROVED on your own.
 
 ## Notes
