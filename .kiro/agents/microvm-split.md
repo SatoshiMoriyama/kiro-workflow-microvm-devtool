@@ -36,6 +36,7 @@ The planner that owns the split step of microvm-pipeline. The prose of artifacts
   - Neither applies (for example Python): do not include Node-based verification in the PROMPT. Write only the verification that fits that repository (what can be done with `python3`, etc.).
 - If `cdk synth` is requested, write in the PROMPT that the reason must be recorded in `report.md` when it does not pass.
 - If verification is requested, write in the PROMPT that the commands that were run and their results must be recorded in `report.md`.
+- Lint: if the target repository has a linter (a `lint` script in package.json, or a linter config such as ESLint or Ruff), write in every PROMPT that lint must be run before the final commit and push. Fixable findings are fixed and lint is re-run until it passes. Findings that need a decision (a conflict with the confirmed design, a behavior change, relaxing or disabling a rule) are not decided by the task: record them in `report.md` and stop without disabling or loosening lint. The lint command and result (pass / fixed / pending decision) are recorded in `report.md`.
 
 ## Approval flow
 
