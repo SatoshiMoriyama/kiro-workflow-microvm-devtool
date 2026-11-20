@@ -71,6 +71,7 @@ Runs for every target repository, after the fix loop ends (APPROVED, or the loop
 - **No linter in the target repository**: do not install one on your own. Present it as an "adoption proposal" (tool, target, the command, expected effect) and wait for the user.
 - **Present before the pr step**: pause with send_message(severity=warning) and show the table (finding / checkable or not / reason / add or not), the inventory result and any adoption proposals. Adjust to the user's answer. Never create the PR before the answer.
 - **Executing additions**: per the user's answer, either (a) throw the check as a separate task to MicroVM (new `kiro/<requestId>`, merged into the integration branch before the pr step, with tests that run and pass) or (b) leave it as an Issue (the body states the finding, the proposed check and the done criteria). Default proposal: (a) for a small check with a clear criterion, (b) when a design decision is involved. Replace the corresponding steering wording when a check takes over a constraint.
+- **Secret scan (this repository)**: on the integration branch after merge-all and before the pr step, the general agent runs `python3 scripts/check_secrets.py origin/main` (exit 1 = detected, report with send_message warning and pause). It scans only added lines of the diff; logs and commit messages are out of scope. The script is not in the MicroVM image, so it is not run inside MicroVM tasks.
 - **Record**: write the result into the repository's documentation location (`docs/` if there is no convention) and put its gist in the PR body.
 ## Procedure
 
@@ -94,8 +95,7 @@ Describe one pipeline in the workflowPrompt of run_workflow and start it. The re
 | merge-all | microvm-merge |
 | review | semantic_reviewer x 2 (mid-tier Claude / mid-tier GPT) + wf-review-aggregator |
 | fix-loop (maxIterations 3) | microvm-run -> microvm-merge -> re-review |
-| check-proposal (mandatory) | general agent presents to the user; if (a), microvm-run -> microvm-merge |
-| check-proposal (mandatory) | wf-coder or general agent; presents to the user, then microvm-run -> microvm-merge if (a) |
+| check-proposal (mandatory) | general agent runs the judgement and presents to the user (no wf-coder); if (a), hand the check to a new MicroVM task: microvm-run -> microvm-merge |
 | pr | microvm-pr |
 
 Always include in the workflowPrompt:

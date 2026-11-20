@@ -12,6 +12,7 @@ import sys
 PATTERNS = {
     "AWS access key ID": re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
     "GitHub token": re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
+    "Kiro API key": re.compile(r"\bksk_[A-Za-z0-9_\-]{8,}"),
     "Private key block": re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----"),
     "Generic secret assignment": re.compile(
         r"(?i)\b(?:api[_-]?key|secret|token|password)\b\s*[:=]\s*[\"'][A-Za-z0-9/+_\-]{20,}[\"']"

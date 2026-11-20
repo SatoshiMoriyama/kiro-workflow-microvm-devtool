@@ -16,7 +16,9 @@
 - 選定: #3 秘密情報の混入。理由: 判定基準が明確(トークン・鍵の形式)、誤検出が少ない、既存コードの変更が不要、違反の影響が大きい。
 - 実体: `scripts/check_secrets.py [BASE_REF]`(`pnpm run check:secrets`)。`BASE_REF...HEAD` の追加行だけを検査。検出時は終了コード 1。
 - テスト: `scripts/test_check_secrets.py`(`pnpm run scripts:test`)。
-- steering 側の文言を、機械検査される旨に更新済み。
+- 検査範囲: 既知形式(AWS・GitHub・Kiro `ksk_`・秘密鍵・汎用代入)の追加行のみ。ログ・コミットメッセージは対象外。
+- 実行タイミング: 統合ブランチで merge-all 後、pr 工程の前に汎用エージェントが実行(SKILL.md の Secret scan)。MicroVM イメージには含まれない。
+- steering 側の文言を、上記の実態に合わせて更新済み。
 
 ## linter の現状と導入提案
 

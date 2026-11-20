@@ -17,6 +17,9 @@ class ScanDiffTest(unittest.TestCase):
     def test_github_token_detected(self):
         self.assertEqual(scan_diff(diff_with("ghp_" + "a" * 36))[0][2], "GitHub token")
 
+    def test_kiro_api_key_detected(self):
+        self.assertEqual(scan_diff(diff_with("ksk_" + "a" * 20))[0][2], "Kiro API key")
+
     def test_private_key_detected(self):
         self.assertTrue(scan_diff(diff_with("-----BEGIN RSA " + "PRIVATE KEY-----")))
 
