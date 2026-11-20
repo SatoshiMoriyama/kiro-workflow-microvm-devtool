@@ -8,7 +8,9 @@
     "synth": "pnpm --filter infra synth",
     "deploy": "bash scripts/deploy.sh",
     "package-image": "bash scripts/package-image.sh",
-    "runs:test": "cd packages/runs-cli && python3 -m unittest discover"
+    "runs:test": "cd packages/runs-cli && python3 -m unittest discover",
+    "check:secrets": "python3 scripts/check_secrets.py",
+    "scripts:test": "cd scripts && python3 -m unittest discover"
   },
   "packageManager": "pnpm@12.10.1",
   "engines": {

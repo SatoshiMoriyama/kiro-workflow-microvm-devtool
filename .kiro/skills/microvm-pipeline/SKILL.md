@@ -63,6 +63,16 @@ A work branch kiro/<requestId> is deleted from origin after it has been merged i
 - **Never bypass**: do not add lint-disable comments, loosen the lint config, or skip the step to make it pass without the user's approval.
 - **Report**: each step reports the lint command, the result (pass / fixed / pending decision), and the files changed by fixes.
 
+## Recurrence-prevention check step (mandatory, never skipped)
+Runs for every target repository, after the fix loop ends (APPROVED, or the loop finished with the user's decision) and before the pr step. Do not skip it even when there were no findings; then report "no findings" and still do the steering inventory part.
+- **Inputs**: all review findings of the run (including rejected / deferred ones), failed or retried MicroVM runs (ok=false, failed push, lint failures), and the target repository's steering / rule documents (e.g. `.kiro/steering/`, `packages/image/steering/`).
+- **Primary judgement (the agent decides, not the user)**: for each finding or failure, decide "checkable / not checkable" by a deterministic check (lint rule, test, script, hook), with a one-line reason, and decide "add / do not add" with a reason. Prefer a check when the criterion is mechanical and false positives are rare. Not checkable examples: design taste, naming judgement, scope judgement.
+- **Steering inventory**: list each constraint of the steering documents and classify it as enforceable / conditionally enforceable / not enforceable with the means or the reason. Pick at most one new candidate per run and record why.
+- **No linter in the target repository**: do not install one on your own. Present it as an "adoption proposal" (tool, target, the command, expected effect) and wait for the user.
+- **Present before the pr step**: pause with send_message(severity=warning) and show the table (finding / checkable or not / reason / add or not), the inventory result and any adoption proposals. Adjust to the user's answer. Never create the PR before the answer.
+- **Executing additions**: per the user's answer, either (a) throw the check as a separate task to MicroVM (new `kiro/<requestId>`, merged into the integration branch before the pr step, with tests that run and pass) or (b) leave it as an Issue (the body states the finding, the proposed check and the done criteria). Default proposal: (a) for a small check with a clear criterion, (b) when a design decision is involved. Replace the corresponding steering wording when a check takes over a constraint.
+- **Secret scan (this repository)**: on the integration branch after merge-all and before the pr step, the general agent runs `python3 scripts/check_secrets.py <base>` with the base decided in step 1 (default origin/main). Any non-zero exit stops before the pr step: 1 = detected, 2 = execution error; report either with send_message warning and pause. It scans only added lines of the diff; logs and commit messages are out of scope. The script is not in the MicroVM image, so it is not run inside MicroVM tasks.
+- **Record**: write the result into the repository's documentation location (`docs/` if there is no convention) and put its gist in the PR body.
 ## Procedure
 
 ### 1. Ask the user for the inputs
@@ -85,6 +95,7 @@ Describe one pipeline in the workflowPrompt of run_workflow and start it. The re
 | merge-all | microvm-merge |
 | review | semantic_reviewer x 2 (mid-tier Claude / mid-tier GPT) + wf-review-aggregator |
 | fix-loop (maxIterations 3) | microvm-run -> microvm-merge -> re-review |
+| check-proposal (mandatory) | general agent runs the judgement and presents to the user (no wf-coder); if (a), hand the check to a new MicroVM task: microvm-run -> microvm-merge |
 | pr | microvm-pr |
 
 Always include in the workflowPrompt:
@@ -92,6 +103,7 @@ Always include in the workflowPrompt:
 - Each step uses the dedicated agent in the table above.
 - The gist of the review policy: once after all parallel merges, mid-tier Claude + mid-tier GPT + mid-tier aggregation (model IDs resolved from the live list, never hard-coded). Fixes always go on a new branch on MicroVM, maxIterations 3, pause and ask the user in a round that is not APPROVED. Keep findings that contradict confirmed specifications with a rejection reason.
 - The gist of the lint policy: if the repository has a linter, run it in every implementation task before push and on the integration branch before the pr step. Fix what can be fixed; pause with send_message(warning) for anything that needs a decision. Never bypass lint.
+- The gist of the recurrence-prevention check step: mandatory between the fix loop and the pr step, never skipped. Judge each finding as checkable / not checkable, inventory steering constraints, propose a linter instead of installing one, and pause to present the result before the pr step.
 - Language of the pipeline artifacts: the prose of artifacts is written in Japanese. Commits are a single-line Conventional Commits message (in Japanese). PR bodies are written in Japanese.
 
 ### 3. Mediation when paused (you)
@@ -103,6 +115,7 @@ When the workflow pauses with send_message(warning), mediate to the user accordi
   - "Fix": continue the fix-loop with update_workflow (extend_repeat or resume). In the next round's fixing MicroVM run, state explicitly which findings to fix and which to reject or defer. Tell the workflow that rejected or deferred findings should be left in the matching review finding with status=rejected / rejectionReason.
   - "No action needed (misjudgement / non-blocking)": complete the loop with update_status and proceed to the pr step.
 - **A lint finding needs a decision**: present the rule, file, line and the options (fix by behavior change, relax the rule, defer) and ask the user to choose. Do not disable or relax lint on your own.
+- **Recurrence-prevention check proposal**: present the table and adoption proposals, ask the user to adjust (add / do not add, MicroVM task or Issue), then continue to the pr step.
 - **maxIterations reached**: summarize the remaining findings and ask the user whether to run one more round (extend_repeat) or to finish with the findings left (update_status completed). Do not rewrite the verdict to APPROVED on your own.
 
 ## Notes
