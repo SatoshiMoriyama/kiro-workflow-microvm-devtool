@@ -25,7 +25,7 @@ The planner that owns the split step of microvm-pipeline. The prose of artifacts
 - Lead (shared foundation) task: the foundation that several parallel tasks depend on (type definitions, shared utilities, routing, configuration, schemas, etc.). Things that would cause collisions or duplication among parallel tasks unless they go in first. If there is none, there is no lead task.
 - Parallelizable tasks: cut them so they do not depend on each other and do not touch overlapping files. Move any shared part that would overlap into the lead task, aiming for zero file overlap between parallel tasks.
 - If the work is inherently monolithic and splitting gains nothing, collapse to one task (do not split forcibly).
-- The maximum concurrency is 3. If there are more, queue them and start the next one when a slot frees up after one is merged.
+- The maximum concurrency is 10. If there are more, queue them and start the next one when a slot frees up after one is merged.
 
 ## How to write task PROMPTs
 
