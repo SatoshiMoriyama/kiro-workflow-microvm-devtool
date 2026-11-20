@@ -20,6 +20,9 @@ class ScanDiffTest(unittest.TestCase):
     def test_kiro_api_key_detected(self):
         self.assertEqual(scan_diff(diff_with("ksk_" + "a" * 20))[0][2], "Kiro API key")
 
+    def test_plusplus_content_line_scanned(self):
+        r = scan_diff(diff_with("++ " + AWS))
+        self.assertEqual(r[0][:2], ("x.txt", 1))
     def test_private_key_detected(self):
         self.assertTrue(scan_diff(diff_with("-----BEGIN RSA " + "PRIVATE KEY-----")))
 

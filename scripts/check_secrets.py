@@ -26,7 +26,7 @@ def scan_diff(diff_text):
     path = None
     lineno = 0
     for line in diff_text.splitlines():
-        if line.startswith("+++ "):
+        if line.startswith("+++ b/") or line.startswith("+++ /dev/null"):
             path = line[6:] if line.startswith("+++ b/") else line[4:]
         elif line.startswith("@@"):
             m = re.search(r"\+(\d+)", line)
