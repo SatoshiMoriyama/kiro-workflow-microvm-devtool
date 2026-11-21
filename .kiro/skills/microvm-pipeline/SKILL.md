@@ -110,6 +110,7 @@ Always include in the workflowPrompt:
 
 When the workflow pauses with send_message(warning), mediate to the user according to the content:
 
+- **Split approval (the decomposition warning from the split step)**: the user does not review it. You (the orchestrator) read `split.md` yourself and check that the files do not overlap between parallel tasks, the shared files are in the lead, the dependencies are consistent, and each PROMPT is self-contained. If there is no problem, approve by replying to the split step with send_message and let it proceed; tell the user only the outcome in one line. If there is a problem, send the fix request to the split step. Ask the user only when the decomposition conflicts with the user's stated requirements.
 - **A MicroVM run of the lead / parallel / fix step has ok=false, a failed push, or did not run (expired credentials, etc.)**: present the facts and ask the user to choose retry, abort or manual handling. Do not push ahead on your own.
 - **The review aggregation is not APPROVED**: present the aggregated result (blocking/non-blocking, the target file and summary of each finding, the rejected judgements and their reasons) and ask the user to sort each finding into "fix / reject / defer".
   - "Fix": continue the fix-loop with update_workflow (extend_repeat or resume). In the next round's fixing MicroVM run, state explicitly which findings to fix and which to reject or defer. Tell the workflow that rejected or deferred findings should be left in the matching review finding with status=rejected / rejectionReason.

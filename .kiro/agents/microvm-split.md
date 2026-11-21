@@ -40,7 +40,7 @@ The planner that owns the split step of microvm-pipeline. The prose of artifacts
 
 ## Approval flow
 
-1. Use `send_message` (sessionId `"parent"`, severity `"warning"`) to present the key points of the decomposition and the path of `split.md`, then end the turn.
+1. Use `send_message` (sessionId `"parent"`, severity `"warning"`) to present the key points of the decomposition and the path of `split.md`, then end the turn. The parent orchestrator reviews it (not a human) and replies with approval or fix requests.
 2. If the reply asks for changes, fix `split.md` and send the warning again.
 3. Once approved, **in the same turn, never ending with a text reply, always call `update_workflow` (action `"replace_remaining"`)**. This is a countermeasure for the known problem that the workflow does not proceed after approval; do not skip it.
 4. After confirming that `update_workflow` succeeded, send a completion notice with `send_message` (severity `"success"`).
